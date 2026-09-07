@@ -315,11 +315,6 @@ class AlgorithmicTelex(
             return word.length to result.toString()
         }
 
-        if (lowerCh == 'w' && word.last().lowercaseChar() == 'ư' && word.length > 1) {
-            val reverted = if (word.last().isUpperCase()) ch.uppercaseChar() else ch
-            return word.length to (word.dropLast(1) + reverted)
-        }
-
         if (isShortcutUndo(word, ch)) {
             return doShortcutUndo(word, ch)
         }
