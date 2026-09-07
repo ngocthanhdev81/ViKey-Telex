@@ -154,7 +154,7 @@ class AlgorithmicTelex(
         "eo" to 'e', "êu" to 'ê',
         "iu" to 'i', "ưu" to 'ư',
         "ây" to 'â',
-    }
+    )
 
     // ── Genuine Unikey single-spelling promotions ────────────────
     // Key = vowel cluster (+coda for the uo-family); value = (plain base,
