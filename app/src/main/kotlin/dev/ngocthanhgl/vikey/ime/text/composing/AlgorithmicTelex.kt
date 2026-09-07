@@ -169,7 +169,7 @@ class AlgorithmicTelex(
                 "a", "ă", "â", "e", "ê", "i", "y", "o", "ô", "ơ", "u", "ư",
                 "ai", "ay", "ây", "ao", "au", "âu", "eo", "êu", "iu",
                 "oi", "ôi", "ơi", "ui", "ưi", "ưu",
-                "ia", "ya", "ua", "ưa", "oa", "oe", "uy", "uya", "uơ",
+                "ia", "ya", "ua", "ưa", "oa", "oă", "oe", "uy", "uya", "uơ",
                 "oai", "oay", "uay",
                 "iêu", "yêu", "uôi", "ươi", "ươu",
             ),
@@ -192,6 +192,7 @@ class AlgorithmicTelex(
             "ươ" to "n ng c t m",
             "uyê" to "n t",
             "oa" to "n t c ch",
+            "oă" to "n t c",
             "oe" to "t",
             "ua" to "ch",
             "uâ" to "n t c",
@@ -330,12 +331,15 @@ class AlgorithmicTelex(
             val candidates = wInterpretations(word)
             if (candidates.isNotEmpty()) {
                 // Ranking only (no hard rhyme gate): prefer legal Vietnamese
-                // rhymes, otherwise take the closest (rightmost) candidate so
-                // free typing still converts and undo stays reachable.
+                // rhymes first (preserves order-independence, e.g. "muaw"
+                // still yields "mưa"); on ties take the NEAREST vowel to the
+                // typed key (rightmost). Unikey standard: a modifier applies
+                // to the immediately preceding vowel, so "hoaw" must yield
+                // "hoă" (→ "hoặc"), never "hơa".
                 val best = candidates.minWithOrNull(
                     compareBy(
                         { if (isValidRhymeWord(it.second.lowercase())) 0 else 1 },
-                        { it.first },
+                        { -it.first },
                     ),
                 )!!
                 return word.length to best.second
@@ -356,6 +360,11 @@ class AlgorithmicTelex(
                 }.joinToString("")
                 return word.length to (reverted + ch)
             }
+
+            // No conversion and nothing to undo: standalone-w semantics
+            // (Unikey: w with no preceding vowel becomes "ư", e.g. "kw"→"kư",
+            // "tr"+"w"→"trư"). handleW also respects telexWEnabled + "ww".
+            return handleW(word, ch)
         }
 
         val shortcut = applyShortcut(word, ch)
@@ -644,12 +653,15 @@ class AlgorithmicTelex(
     // ──────────────────────────────────────────────────────────────
 
     private fun retroactiveDd(word: String, ch: Char): String? {
-        if (ch.lowercaseChar() != 'd' || word.length < 2) return null
-        val first = word.first()
-        if (first == 'd' || first == 'D') {
-            val rest = word.substring(1)
-            val dd = if (first == 'D') 'Đ' else 'đ'
-            return "$dd$rest"
+        if (ch.lowercaseChar() != 'd') return null
+        val last = word.lastOrNull() ?: return null
+        // Unikey standard: only an ADJACENT "dd" pair becomes "đ" — never
+        // pair the new 'd' with a distant leading 'd' ("duckd"+d → "duckđ",
+        // not "đuckd"). Undo ("đ"+d → "dd") is handled earlier by the
+        // generic isShortcutUndo path, so it is intentionally absent here.
+        if (last == 'd' || last == 'D') {
+            val dd = if (last == 'D' || ch.isUpperCase()) 'Đ' else 'đ'
+            return word.dropLast(1) + dd
         }
         return null
     }

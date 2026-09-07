@@ -87,7 +87,9 @@ class TelexTest {
     @Test
     fun testDoubleWCancelMultiChar() {
         assertEquals("polkw", simulate("polkww"))
-        assertEquals("polkww", simulate("polkwww"))
+        // Third w converts again (Unikey: w targets nearest vowel o→ơ);
+        // the previous w was already consumed by undo
+        assertEquals("pơlkw", simulate("polkwww"))
     }
 
     @Test
@@ -110,5 +112,29 @@ class TelexTest {
         assertEquals("familys", simulate("familys"))
         assertEquals("quicklys", simulate("quicklys"))
         assertEquals("oks", simulate("oks"))
+    }
+
+    @Test
+    fun testDdAdjacentOnlyUnikey() {
+        assertEquals("đ", simulate("dd"))
+        assertEquals("Đ", simulate("Dd"))
+        assertEquals("đau", simulate("ddau"))
+        // The new 'd' pairs only with an ADJACENT 'd', never a distant leading one
+        assertEquals("duckđ", simulate("duckdd"))
+        // Pressing 'd' again undoes đ back to dd
+        assertEquals("duckdd", simulate("duckddd"))
+    }
+
+    @Test
+    fun testWTargetsNearestVowelUnikey() {
+        // w modifies the immediately preceding vowel: hoaw → hoă, not hơa
+        assertEquals("hoă", simulate("hoaw"))
+        assertEquals("hoặc", simulate("hoawjc"))
+        assertEquals("hoặc", simulate("hoacj"))
+        assertEquals("oắt", simulate("oawts"))
+        // Validity still outranks proximity (order-independence preserved)
+        assertEquals("mưa", simulate("muaw"))
+        // w-undo still reachable
+        assertEquals("tuw", simulate("tuww"))
     }
 }

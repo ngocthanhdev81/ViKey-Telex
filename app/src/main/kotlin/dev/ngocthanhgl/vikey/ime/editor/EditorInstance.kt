@@ -224,7 +224,10 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
      * whose decision inputs are unaffected by the pending suggestion commit.
      */
     fun commitChar(char: String, replaceTrailingSpace: Boolean): Boolean {
-        if (replaceTrailingSpace && char.length == 1 && char[0] in ",.;:?!") {
+        // Mirror KeyboardManager's auto-commit trigger (any non-alphabetic):
+        // a just-committed "word " must collapse to "word<char>" for digits
+        // and symbols too ("alo"+5 → "alo5"), not only ",.;:?!".
+        if (replaceTrailingSpace && char.length == 1 && !char[0].isLetter()) {
             val insertSpaceAfter = shouldInsertAutoSpaceAfter(char)
             val payload = if (insertSpaceAfter) "$char$SPACE" else char
             if (deleteSurroundingAndCommitSync(1, payload)) {
