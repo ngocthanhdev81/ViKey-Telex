@@ -166,7 +166,7 @@ class AlgorithmicTelex(
                 "oi", "ôi", "ơi", "ui", "ưi", "ưu",
                 "ia", "ya", "ua", "ưa", "oa", "oă", "oe", "uy", "uya", "uơ",
                 "oai", "oay", "uay",
-                "iêu", "yêu", "uôi", "ươi", "ươu",
+                "iêu", "yêu", "uê", "uôi", "ươi", "ươu",
             ),
         )
         val closed = mapOf(
@@ -334,7 +334,7 @@ class AlgorithmicTelex(
                 val cand = word.substring(0, pos) +
                     transformVowel(word[pos], target) + word.substring(pos + 1)
                 if (isValidRhymeWord(cand.lowercase())) {
-                    return word.length to cand
+                    return word.length to migrateToneToMain(cand)
                 }
             }
 
@@ -362,7 +362,7 @@ class AlgorithmicTelex(
 
         val shortcut = applyShortcut(word, ch)
         if (shortcut != null) {
-            return word.length to shortcut
+            return word.length to migrateToneToMain(shortcut)
         }
 
         val distant = applyDistantShortcut(word, ch)
@@ -481,9 +481,18 @@ class AlgorithmicTelex(
         }
 
         val last = word.last().lowercaseChar()
-        val key2 = "$last$lowerCh"
+        val key2 = "${toBaseForm(last)}$lowerCh"
         val result2 = shortcuts2[key2]
         if (result2 != null) {
+            val dropped = word.last()
+            val toned = reverseToneMaps[dropped.lowercaseChar()]
+            if (toned != null) {
+                // Tone-transfer (Unikey: "thué"+e → "thuế", "mó"+o → "mố"):
+                // the replaced char carried a tone — keep it on the new mark.
+                val carried = toneMaps[toned.second]?.get(result2) ?: result2
+                val cased = if (dropped.isUpperCase()) carried.uppercaseChar() else carried
+                return word.dropLast(1) + cased
+            }
             val mode = casingMode(word.last().toString())
             return word.dropLast(1) + applyCasing(result2.toString(), mode)
         }
@@ -564,7 +573,7 @@ class AlgorithmicTelex(
             return null
         }
 
-        scanConvert(word)?.let { return it }
+        scanConvert(word)?.let { return migrateToneToMain(it) }
 
         // Toggle fixed-point (Unikey-verified: "lôi"+o → "loio" but
         // "tâi"+a → "tâia"): when nothing is convertible but something is
@@ -743,6 +752,30 @@ class AlgorithmicTelex(
         }
 
         return vowelPositions.last()
+    }
+
+    // Unikey parity ("khuýen"+e → "khuyến", "mýe"+e → "myế"): after a
+    // mark-creating conversion, a tone stranded off the main vowel migrates
+    // to it. No tone, unresolvable main, or tone already on main → unchanged.
+    private fun migrateToneToMain(buf: String): String {
+        val tonePos = buf.indices.firstOrNull {
+            reverseToneMaps[buf[it].lowercaseChar()] != null
+        } ?: return buf
+        val clean = stripTones(buf)
+        val syllable = parseSyllable(clean.lowercase()) ?: return buf
+        val main = resolveTonePosition(clean, syllable)
+        if (main < 0 || main == tonePos) return buf
+        val (tonelessBase, toneKey) = reverseToneMaps[buf[tonePos].lowercaseChar()] ?: return buf
+        val chars = buf.toCharArray()
+        chars[tonePos] = if (buf[tonePos].isUpperCase()) {
+            tonelessBase.uppercaseChar()
+        } else {
+            tonelessBase
+        }
+        val mainMarked = toBaseForm(buf[main].lowercaseChar())
+        val mainToned = toneMaps[toneKey]?.get(mainMarked) ?: return buf
+        chars[main] = if (buf[main].isUpperCase()) mainToned.uppercaseChar() else mainToned
+        return String(chars)
     }
 
     // ──────────────────────────────────────────────────────────────

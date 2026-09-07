@@ -145,6 +145,18 @@ class TelexTest {
     }
 
     @Test
+    fun testToneMigrationToMain() {
+        // Unikey-verified: a tone stranded off the main vowel migrates to it
+        // once the true main appears ("khuýen"+e → "khuyến", not "khuýên")
+        assertEquals("khuyến", simulate("khuyense"))
+        assertEquals("myế", simulate("myee"))
+        // Tone-transfer through adjacent doubling ("thué"+e → "thuế")
+        assertEquals("thuế", simulate("thuese"))
+        // Derived (same transfer mechanism): "mó"+o keeps its tone
+        assertEquals("mố", simulate("móo"))
+    }
+
+    @Test
     fun testDistantToggleFixedPoint() {
         // Toggle: revert only undoes the last EFFECTIVE keypress.
         // "lôi"+o → "loio" (4th o converted o→ô, 5th o undoes it)
