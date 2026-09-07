@@ -198,5 +198,9 @@ class TelexTest {
         assertEquals("mưa", simulate("muaw"))
         // w-undo still reachable
         assertEquals("tuw", simulate("tuww"))
+        assertEquals("luw", simulate("luww"))
+        // Detached-ư undo (field bug): "soft"+w appends standalone ư
+        // (no vowel touched), so 2nd w REPLACES it — "softw", not "softuw"
+        assertEquals("softw", simulate("softww"))
     }
 }

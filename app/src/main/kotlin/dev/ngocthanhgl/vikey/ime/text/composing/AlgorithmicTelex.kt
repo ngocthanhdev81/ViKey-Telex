@@ -316,6 +316,19 @@ class AlgorithmicTelex(
         }
 
         if (isShortcutUndo(word, ch)) {
+            // Unikey parity, joined-vs-detached ư (field bug: "softư"+w gave
+            // "softuw" instead of "softw"): a trailing ư inside a VALID
+            // syllable ("tư") undoes a conversion (restore base + append key),
+            // but a DETACHED ư ("softư" — w appended standalone after "soft",
+            // touching no vowel) is replaced by the key, fabricating no 'u'.
+            // Only ư is dual-origin (convertible AND appendable); ơ/ă always
+            // restore via doShortcutUndo below.
+            if (lowerCh == 'w' && word.last().lowercaseChar() == 'ư' &&
+                !isValidRhymeWord(word.lowercase())
+            ) {
+                val replaced = if (word.last().isUpperCase()) ch.uppercaseChar() else ch
+                return word.length to (word.dropLast(1) + replaced)
+            }
             return doShortcutUndo(word, ch)
         }
 
