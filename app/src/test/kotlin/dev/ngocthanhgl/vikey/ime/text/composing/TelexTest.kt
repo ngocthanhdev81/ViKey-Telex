@@ -131,18 +131,31 @@ class TelexTest {
     }
 
     @Test
-    fun testUnikeyPromotions() {
-        // Genuine single-spelling promotions (mark has no other source;
-        // w-targeting would pick the wrong word: muốn≠mướn, thuốc≠thước)
-        assertEquals("muối", simulate("muois"))
-        assertEquals("khuyến", simulate("khuyens"))
-        assertEquals("muốn", simulate("muons"))
-        assertEquals("mượn", simulate("muonj"))
-        assertEquals("vườn", simulate("vuonf"))
-        assertEquals("thưởng", simulate("thuongr"))
-        assertEquals("thuốc", simulate("thuocs"))
-        assertEquals("tuốt", simulate("tuots"))
+    fun testUnikeyNoPromotions() {
+        // Unikey-verified: the tone key NEVER changes the mark — no
+        // ie/ye/uoi/uye/uon-style promotions exist. Position only.
+        assertEquals("muói", simulate("muois"))
+        assertEquals("khuýen", simulate("khuyens"))
+        assertEquals("vuòn", simulate("vuonf"))
+        assertEquals("muón", simulate("muons"))
+        assertEquals("muọn", simulate("muonj"))
+        assertEquals("tién", simulate("tiens"))
+        assertEquals("býe", simulate("byes"))
         assertEquals("lòng", simulate("longf"))
+    }
+
+    @Test
+    fun testDistantToggleFixedPoint() {
+        // Toggle: revert only undoes the last EFFECTIVE keypress.
+        // "lôi"+o → "loio" (4th o converted o→ô, 5th o undoes it)
+        assertEquals("loio", simulate("loioo"))
+        // "tâi"+a → "tâia" ("tai"+a refused, nothing to undo → append).
+        // NOTE: "tâi" itself needs doubling ("taai"), since "taia" refuses.
+        assertEquals("tâia", simulate("taaia"))
+        // Contrast pair proving strict-validity decides, not position:
+        // "ây" is a real rhyme (convert), "âi" is not (literal)
+        assertEquals("tây", simulate("taya"))
+        assertEquals("taia", simulate("taia"))
     }
 
     @Test
