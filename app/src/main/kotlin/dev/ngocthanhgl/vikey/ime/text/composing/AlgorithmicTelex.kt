@@ -146,10 +146,12 @@ class AlgorithmicTelex(
         // NOTE: there are deliberately NO "ie"/"ye"/"ieu"/"yeu"/"eu" → 'ê'
         // entries. Unikey has no such promotions (proven: "yes"→"ýe",
         // "diets"→"diét", "inter"→"intẻ"); every iê/yê/êu word is typed
-        // with a doubled e ("tieen", "yeen", "yeeu"). The genuine
-        // single-spelling promotions live in promotionRules below.
+        // with a doubled e ("tieen", "yeen", "yeeu"). All entries below
+        // are POSITION rules only — plain marks never change.
         "ai" to 'a', "ay" to 'a', "au" to 'a', "ao" to 'a',
         "oi" to 'o', "ôi" to 'ô', "ơi" to 'ơ',
+        // Unikey-verified: "muois"→"muói" (tone on middle o, not last i).
+        "uoi" to 'o',
         "ui" to 'u', "ưi" to 'ư',
         "eo" to 'e', "êu" to 'ê',
         "iu" to 'i', "ưu" to 'ư',
@@ -219,7 +221,10 @@ class AlgorithmicTelex(
             }
         }
         if (remaining.isEmpty()) return null
-        if (!matched) return null
+        // Vowel-initial buffer (no onset): rhyme is the whole string.
+        // Without this, every modifier on onset-less words ("aw"→"ă",
+        // "oa"+w→"oă") was refused and fell through to literal append.
+        if (!matched && toBaseForm(remaining.first()) !in baseVowels) return null
         return remaining
     }
 

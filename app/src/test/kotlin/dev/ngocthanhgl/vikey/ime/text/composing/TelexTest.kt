@@ -142,6 +142,9 @@ class TelexTest {
         assertEquals("tién", simulate("tiens"))
         assertEquals("býe", simulate("byes"))
         assertEquals("lòng", simulate("longf"))
+        // Unikey-verified position rule: "uoi"→middle o, not last i
+        // (field bug: "muois" gave "muoí" instead of "muói")
+        assertEquals("tuói", simulate("tuois"))
     }
 
     @Test
@@ -188,6 +191,9 @@ class TelexTest {
         assertEquals("hoặc", simulate("hoawjc"))
         assertEquals("hoặc", simulate("hoacj"))
         assertEquals("oắt", simulate("oawts"))
+        // Onset-less buffers must also pass validity ("oa"+w→"oă",
+        // field bug: splitRhymeBase required an onset)
+        assertEquals("oă", simulate("oaw"))
         // Validity still outranks proximity (order-independence preserved)
         assertEquals("mưa", simulate("muaw"))
         // w-undo still reachable
