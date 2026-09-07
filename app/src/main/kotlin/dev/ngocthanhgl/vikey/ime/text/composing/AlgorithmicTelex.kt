@@ -34,9 +34,6 @@ class AlgorithmicTelex(
     companion object {
         val VOWEL_SPLIT_REGEX = Regex("[aeiouyăâêôơ]")
         val DISTANT_MODIFIERS = setOf('a', 'e', 'o', 'w')
-        private const val VIET_DIGRAPHS =
-            "ưa|ươ|uô|iê|yê|uya|uyê|ươi|ươu|uôi|oai|oay"
-        private val vietDigraphList = VIET_DIGRAPHS.split("|")
     }
 
     // ── Character classification ──────────────────────────────────
@@ -46,11 +43,6 @@ class AlgorithmicTelex(
     private val baseVowels = setOf(
         'a', 'ă', 'â', 'e', 'ê', 'i',
         'o', 'ô', 'ơ', 'u', 'ư', 'y',
-    )
-
-    private val consonantLetters = setOf(
-        'b', 'c', 'd', 'đ', 'g', 'h', 'j', 'k', 'l', 'm', 'n',
-        'p', 'q', 'r', 's', 't', 'v', 'x',
     )
 
     // ── Vietnamese onset consonants (longest first) ───────────────
@@ -145,20 +137,40 @@ class AlgorithmicTelex(
         "oa" to 'a', "oe" to 'e', "uy" to 'y',
         "ưa" to 'ư', "ươ" to 'ơ', "uô" to 'ô',
         "ua" to 'u', "iê" to 'ê', "yê" to 'ê',
-        "uyê" to 'ê', "uya" to 'y', "uye" to 'ê',
+        "uyê" to 'ê', "uya" to 'y',
         "uôi" to 'ô', "ươi" to 'ơ', "ươu" to 'ơ',
         "oai" to 'a', "oay" to 'a', "uay" to 'a',
         "oeo" to 'e', "oeu" to 'e',
         "ia" to 'i', "ya" to 'y',
         "iêu" to 'ê', "yêu" to 'ê',
-        // Plain-spelling clusters (typed without w/ee/oo yet): e.g. "tien"+f
-        "ie" to 'ê', "ye" to 'ê', "ieu" to 'ê', "yeu" to 'ê',
+        // NOTE: there are deliberately NO "ie"/"ye"/"ieu"/"yeu"/"eu" → 'ê'
+        // entries. Unikey has no such promotions (proven: "yes"→"ýe",
+        // "diets"→"diét", "inter"→"intẻ"); every iê/yê/êu word is typed
+        // with a doubled e ("tieen", "yeen", "yeeu"). The genuine
+        // single-spelling promotions live in promotionRules below.
         "ai" to 'a', "ay" to 'a', "au" to 'a', "ao" to 'a',
         "oi" to 'o', "ôi" to 'ô', "ơi" to 'ơ',
         "ui" to 'u', "ưi" to 'ư',
-        "eo" to 'e', "êu" to 'ê', "eu" to 'ê',
+        "eo" to 'e', "êu" to 'ê',
         "iu" to 'i', "ưu" to 'ư',
         "ây" to 'â',
+    }
+
+    // ── Genuine Unikey single-spelling promotions ────────────────
+    // Key = vowel cluster (+coda for the uo-family); value = (plain base,
+    // mark). The mark has NO other source here, proven by minimal pairs
+    // where w-targeting would pick the wrong word:
+    //   "muois" → "muối" (w would give "mưới"), "khuyens" → "khuyến",
+    //   "muons" → "muốn" (w would give "mướn"), "thuongr" → "thưởng",
+    //   "thuocs" → "thuốc" (w would give "thước"),
+    //   "tuots" → "tuốt" (w would give "tướt").
+    private val promotionRules = mapOf(
+        "uoi" to ('o' to 'ô'),
+        "uye" to ('e' to 'ê'),
+        "uon" to ('o' to 'ơ'),
+        "uong" to ('o' to 'ơ'),
+        "uoc" to ('o' to 'ơ'),
+        "uot" to ('o' to 'ô'),
     )
 
     // ── Legal Vietnamese rhymes (order-independence validity gate) ──
@@ -183,7 +195,7 @@ class AlgorithmicTelex(
             "i" to "m n nh ng ch t p",
             "o" to "m n ng p t c",
             "ô" to "m n ng p t c",
-            "ơ" to "n ng m t",
+            "ơ" to "n ng m t p",
             "u" to "m n ng p t c",
             "ư" to "n ng c t p",
             "iê" to "n ng c t m p",
@@ -328,21 +340,19 @@ class AlgorithmicTelex(
             // Try conversions first (e.g. ưo → ươ, u → ư)
             convertUoPair(word)?.let { return word.length to it }
 
-            val candidates = wInterpretations(word)
-            if (candidates.isNotEmpty()) {
-                // Ranking only (no hard rhyme gate): prefer legal Vietnamese
-                // rhymes first (preserves order-independence, e.g. "muaw"
-                // still yields "mưa"); on ties take the NEAREST vowel to the
-                // typed key (rightmost). Unikey standard: a modifier applies
-                // to the immediately preceding vowel, so "hoaw" must yield
-                // "hoă" (→ "hoặc"), never "hơa".
-                val best = candidates.minWithOrNull(
-                    compareBy(
-                        { if (isValidRhymeWord(it.second.lowercase())) 0 else 1 },
-                        { -it.first },
-                    ),
-                )!!
-                return word.length to best.second
+            // Unikey parity: scan right-to-left for the nearest vowel with a
+            // w-convertible base; accept the first whose result is a valid
+            // Vietnamese rhyme ("muaw"→"mưa" skips invalid "muă";
+            // "polkw" refuses "pơlk" and falls through to handleW → "polkư").
+            for (pos in findVowelPositions(word).asReversed()) {
+                val base = toBaseForm(word[pos].lowercaseChar())
+                val target = wTargetFor(base) ?: continue
+                if (word[pos].lowercaseChar() == target) continue
+                val cand = word.substring(0, pos) +
+                    transformVowel(word[pos], target) + word.substring(pos + 1)
+                if (isValidRhymeWord(cand.lowercase())) {
+                    return word.length to cand
+                }
             }
 
             // Undo only if no conversion worked
@@ -395,20 +405,25 @@ class AlgorithmicTelex(
             return word.length to (word + ch)
         }
 
-        // Nucleus must be pure vowels — consonants in nucleus mean the
-        // syllable is not a valid Vietnamese syllable (e.g. "inte" parsed
-        // as nucleus "inte" with consonants n,t). Treat tone key as literal.
-        if (syllable.nucleus.any { toBaseForm(it) !in baseVowels }) {
+        // Unikey parity: a tone key only marks when the word ends in a vowel
+        // or a valid Vietnamese coda ("quickly"→"quicklý", "mailbox"→"mailbõ",
+        // "abandons"→"abandón"; "edicts" stays literal because of "ct").
+        val vowelPositions = findVowelPositions(clean)
+        if (vowelPositions.isEmpty()) {
+            return word.length to (word + ch)
+        }
+        val tail = clean.lowercase().substring(vowelPositions.last() + 1)
+        if (tail.isNotEmpty() && tail !in knownCodas) {
             return word.length to (word + ch)
         }
 
-        val tonePos = resolveTonePosition(clean, syllable)
+        val (tonePos, markOverride) = resolveTonePosition(clean, syllable)
         if (tonePos < 0) {
             return word.length to (word + ch)
         }
 
         val current = word[tonePos]
-        val base = toBaseForm(current)
+        val base = markOverride ?: toBaseForm(current)
         val toned = toneMaps[toneKey]?.get(base) ?: current
 
         if (current.lowercaseChar() == toned) {
@@ -529,22 +544,6 @@ class AlgorithmicTelex(
         return null
     }
 
-    private fun wInterpretations(word: String): List<Pair<Int, String>> {
-        val out = mutableListOf<Pair<Int, String>>()
-        val positions = findVowelPositions(word)
-        applyShortcut(word, 'w')?.let { sc ->
-            out.add((positions.lastOrNull() ?: (word.length - 1)) to sc)
-        }
-        for (pos in positions.asReversed()) {
-            val base = toBaseForm(word[pos].lowercaseChar())
-            val target = wTargetFor(base) ?: continue
-            if (word[pos].lowercaseChar() == target) continue
-            val cand = word.substring(0, pos) + transformVowel(word[pos], target) + word.substring(pos + 1)
-            out.add(pos to cand)
-        }
-        return out
-    }
-
     // ──────────────────────────────────────────────────────────────
     //  Distant shortcut handling (Unikey standard)
     //  Applies a vowel modifier to the last modifiable vowel of a
@@ -554,15 +553,6 @@ class AlgorithmicTelex(
     private fun applyDistantShortcut(word: String, ch: Char): String? {
         val lowerCh = ch.lowercaseChar()
         if (lowerCh !in DISTANT_MODIFIERS) return null
-
-        val syllable = parseSyllable(stripTones(word.lowercase())) ?: return null
-        if (syllable.nucleus.isEmpty() || syllable.nucleus.any { toBaseForm(it) !in baseVowels }) {
-            return null
-        }
-
-        if (lowerCh == 'w') {
-            convertUoPair(word)?.let { return it }
-        }
 
         fun targetFor(pos: Int): Char? {
             val base = toBaseForm(word[pos].lowercaseChar())
@@ -575,40 +565,18 @@ class AlgorithmicTelex(
             }
         }
 
-        // Pass 1: ranking only (no hard rhyme gate) — prefer candidates
-        // forming a legal Vietnamese rhyme, otherwise fall back to the
-        // rightmost transformable vowel so free typing still converts.
-        val pass1 = mutableListOf<Pair<Int, String>>()
+        // Unikey parity: scan right-to-left for the nearest vowel with a
+        // matching base; accept the first whose result is a valid rhyme
+        // ("loio"→"lôi"). If none qualifies, refuse and let the caller
+        // append literally ("taia", "leie", "abandona" stay untouched).
+        // Adjacent undo ("tâ"+a → "taa") is handled earlier by the generic
+        // isShortcutUndo path, so no revert fallback lives here.
         for (pos in findVowelPositions(word).asReversed()) {
             val target = targetFor(pos) ?: continue
-            if (word[pos].lowercaseChar() != target) {
-                val cand = word.substring(0, pos) + transformVowel(word[pos], target) + word.substring(pos + 1)
-                pass1.add(pos to cand)
-            }
-        }
-        pass1.minWithOrNull(
-            compareBy(
-                { if (isValidRhymeWord(it.second.lowercase())) 0 else 1 },
-                { -it.first },
-            ),
-        )?.let { return it.second }
-
-        // Revert path (unchanged semantics)
-        for (pos in findVowelPositions(word).asReversed()) {
-            val target = targetFor(pos) ?: continue
-            if (word[pos].lowercaseChar() == target) {
-                val base = toBaseForm(word[pos].lowercaseChar())
-                val revertTarget = reverseShortcuts[base]?.first ?: base
-                return word.substring(0, pos) + transformVowel(word[pos], revertTarget) +
-                    word.substring(pos + 1) + ch
-            }
-        }
-
-        // Pass 2: legacy fallback (first transformable right-to-left)
-        for (pos in findVowelPositions(word).asReversed()) {
-            val target = targetFor(pos) ?: continue
-            if (word[pos].lowercaseChar() != target) {
-                return word.substring(0, pos) + transformVowel(word[pos], target) + word.substring(pos + 1)
+            if (word[pos].lowercaseChar() == target) continue
+            val cand = word.substring(0, pos) + transformVowel(word[pos], target) + word.substring(pos + 1)
+            if (isValidRhymeWord(cand.lowercase())) {
+                return cand
             }
         }
 
@@ -728,10 +696,13 @@ class AlgorithmicTelex(
     //  Tone position resolver (Vietnamese orthographic rules)
     // ──────────────────────────────────────────────────────────────
 
-    private fun resolveTonePosition(word: String, syllable: Syllable): Int {
+    // Returns (tone position, mark override). The override is non-null only
+    // for genuine Unikey promotions (promotionRules), where the rule both
+    // positions (last convertible vowel) and changes the mark.
+    private fun resolveTonePosition(word: String, syllable: Syllable): Pair<Int, Char?> {
         val vowelPositions = findVowelPositions(word)
-        if (vowelPositions.isEmpty()) return -1
-        if (vowelPositions.size == 1) return vowelPositions[0]
+        if (vowelPositions.isEmpty()) return -1 to null
+        if (vowelPositions.size == 1) return vowelPositions[0] to null
 
         val vowelCluster = buildString {
             for (pos in vowelPositions) {
@@ -739,42 +710,42 @@ class AlgorithmicTelex(
             }
         }
 
+        val promo = promotionRules[vowelCluster + syllable.coda] ?: promotionRules[vowelCluster]
+        if (promo != null) {
+            for (pos in vowelPositions.asReversed()) {
+                if (toBaseForm(word[pos].lowercaseChar()) == promo.first) {
+                    return pos to promo.second
+                }
+            }
+        }
+
         val rule = toneRules[vowelCluster]
         if (rule != null) {
             for (pos in vowelPositions) {
                 if (toBaseForm(word[pos].lowercaseChar()) == rule) {
-                    return pos
-                }
-            }
-            // Plain-spelling cluster (e.g. "ieu" typed without w/ee yet):
-            // no char has the rule's diacritic class yet — fall back to the
-            // plain member of the same class family so the tone lands right.
-            val expanded = when (rule) {
-                'ê' -> arrayOf('e')
-                'ô' -> arrayOf('o')
-                'ơ' -> arrayOf('o', 'u')
-                else -> emptyArray()
-            }
-            if (expanded.isNotEmpty()) {
-                for (pos in vowelPositions) {
-                    if (toBaseForm(word[pos].lowercaseChar()) in expanded) {
-                        return pos
-                    }
+                    return pos to null
                 }
             }
         }
 
         for (pos in vowelPositions) {
             val b = toBaseForm(word[pos].lowercaseChar())
-            if (b == 'ê' || b == 'ơ') return pos
+            if (b == 'ê' || b == 'ơ') return pos to null
         }
 
         for (pos in vowelPositions) {
             val b = toBaseForm(word[pos].lowercaseChar())
-            if (b == 'â' || b == 'ă' || b == 'ô') return pos
+            if (b == 'â' || b == 'ă' || b == 'ô') return pos to null
         }
 
-        return vowelPositions.last()
+        // No rule matched: Unikey marks the rightmost 'y' if present
+        // ("yes"→"ýe", "quickly"→"quicklý", "family"→"familý"),
+        // otherwise the last vowel ("diets"→"diét", "abandons"→"abandón").
+        for (pos in vowelPositions.asReversed()) {
+            if (toBaseForm(word[pos].lowercaseChar()) == 'y') return pos to null
+        }
+
+        return vowelPositions.last() to null
     }
 
     // ──────────────────────────────────────────────────────────────
