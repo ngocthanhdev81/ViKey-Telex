@@ -595,11 +595,10 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
         // Enter ends the typed word: learn it into the personal dictionary.
         nlpManager.clearCompositionState()
         return if (activeInfo.isRawInputEditor) {
-            sendDownUpKeyEvent(KeyCode.KEYCODE_ENTER)
+            sendDownUpKeyEvent(KeyEvent.KEYCODE_ENTER)
         } else {
             commitText("\n")
         }
-    }
     }
 
     fun tryPerformEnterCommitRaw(): Boolean {
