@@ -539,7 +539,7 @@ class NlpManager(context: Context) {
             else -> emptyList()
         }
         activeCandidates = candidates
-        autoExpandCollapseSmartbarActions()
+        autoExpandCollapseSmartbarActions(candidates.isNotEmpty())
     }
 
     /**
@@ -569,11 +569,18 @@ class NlpManager(context: Context) {
             .sortedByDescending { it.confidence }
     }
 
-    fun autoExpandCollapseSmartbarActions() {
+    /**
+     * Auto-manages the smartbar shared-actions row against suggestion visibility:
+     * suggestions showing → collapse actions to make room for the candidates row;
+     * no suggestions (e.g. text deleted) → expand actions (the auto-expand function).
+     * Manual toggle still works; the next suggestion update re-applies auto state.
+     */
+    fun autoExpandCollapseSmartbarActions(hasSuggestions: Boolean) {
         if (!prefs.smartbar.enabled.get()) return
         if (!prefs.smartbar.sharedActionsAutoExpandCollapse.get()) return
+        if (!isSuggestionOn()) return
         scope.launch {
-            prefs.smartbar.sharedActionsExpanded.set(true)
+            prefs.smartbar.sharedActionsExpanded.set(!hasSuggestions)
         }
     }
 
