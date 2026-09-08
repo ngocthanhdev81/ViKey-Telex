@@ -97,7 +97,20 @@ class GlideTypingManager(context: Context) : GlideTypingGesture.Listener {
         scope.launch(Dispatchers.Default) {
             val rawSuggestions = glideTypingClassifier.getSuggestions(MAX_SUGGESTION_COUNT, true)
             if (rawSuggestions.isEmpty()) {
-                withContext(Dispatchers.Main) { callback.invoke(false) }
+                // Pool has no match (OOV: names, slang, loanwords). Fall back to
+                // the literal trail decode so the glide still produces text.
+                // commitGesture() learns the word, growing the future pool.
+                val trail = glideTypingClassifier.decodeTrailLetters()
+                withContext(Dispatchers.Main) {
+                    if (trail != null) {
+                        val fixed = keyboardManager.fixCase(trail)
+                        nlpManager.suggestDirectly(listOf(WordSuggestionCandidate(fixed, confidence = 1.0)))
+                        if (commit) keyboardManager.commitGesture(fixed)
+                        callback.invoke(true)
+                    } else {
+                        callback.invoke(false)
+                    }
+                }
                 return@launch
             }
             val textBefore = editorInstance.activeContent.textBeforeSelection

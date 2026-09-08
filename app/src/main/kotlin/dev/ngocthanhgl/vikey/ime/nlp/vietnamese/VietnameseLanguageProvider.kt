@@ -36,6 +36,12 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         private const val PERSONAL_DATA_FILE = "vietnamese_user_data.json"
         private const val BIGRAM_MAX_ENTRIES = 4096
         private const val PERSONAL_BOOST_WEIGHT = 0.5
+
+        // Geometric-rank prior for glide rerank fusion (see
+        // rerankGlideSuggestions): bigram evidence lives in [0, 1], so a
+        // prior of 1.0 keeps geometry primary while letting strong context
+        // promote within the top ranks.
+        private const val GEO_PRIOR = 1.0
         private const val BIGRAM_SMOOTHING_K = 6.0
 
         /**
@@ -375,11 +381,15 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
     ): List<String> {
         if (candidates.size < 2) return candidates
         val prevWord = textBefore.substringAfterLast(' ').trim().trimEnd(',', '.', '?', '!', ';', ':')
-        val scored = ArrayList<Pair<String, Double>>(candidates.size)
-        for (candidate in candidates) {
-            scored.add(candidate to getBigramFrequencyFor(prevWord, candidate))
-        }
-        return scored.sortedByDescending { it.second }.map { it.first }
+        // Fuse context with geometry: candidates arrive geometrically ordered
+        // (best first). A pure bigram sort would let a context-lucky poor
+        // shape beat the true trail, so geometry stays primary via a
+        // decaying prior — strong bigram evidence (up to +1.0) can still
+        // promote a candidate from the top ranks, but never resurrect a
+        // geometrically hopeless one.
+        return candidates.mapIndexed { index, candidate ->
+            candidate to (getBigramFrequencyFor(prevWord, candidate) + GEO_PRIOR / (index + 1))
+        }.sortedByDescending { it.second }.map { it.first }
     }
 
     private fun applyCasePattern(typed: String, word: String): String {

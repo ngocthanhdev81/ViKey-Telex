@@ -24,6 +24,7 @@ import dev.ngocthanhgl.vikey.ime.core.Subtype
 import dev.ngocthanhgl.vikey.ime.keyboard.KeyData
 import dev.ngocthanhgl.vikey.ime.text.key.KeyCode
 import dev.ngocthanhgl.vikey.ime.text.keyboard.TextKey
+import dev.ngocthanhgl.vikey.ime.text.keyboard.TextKeyData
 import dev.ngocthanhgl.vikey.nlpManager
 import java.text.Normalizer
 import java.util.*
@@ -207,6 +208,34 @@ class StatisticalGlideTypingClassifier(context: Context) : GlideTypingClassifier
         val userGesture = gesture.resample(SAMPLING_POINTS)
         val normalizedUserGesture: Gesture = userGesture.normalizeByBoxSide()
         remainingWords = pruner.pruneByLength(gesture, remainingWords, keysByCharacter, keys)
+        // Extremity weighting: points far from the gesture centroid (turns,
+        // endpoints — the most informative samples) weigh up to 3x more than
+        // points near the centroid (straight transit segments). Indices match
+        // between raw and normalized gestures (same resample order).
+        val pointWeights = FloatArray(SAMPLING_POINTS)
+        var cx = 0.0f
+        var cy = 0.0f
+        for (i in 0 until SAMPLING_POINTS) {
+            cx += userGesture.getX(i)
+            cy += userGesture.getY(i)
+        }
+        cx /= SAMPLING_POINTS
+        cy /= SAMPLING_POINTS
+        var maxDist = 0.0f
+        for (i in 0 until SAMPLING_POINTS) {
+            val dx = userGesture.getX(i) - cx
+            val dy = userGesture.getY(i) - cy
+            val d = sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+            pointWeights[i] = d
+            if (d > maxDist) maxDist = d
+        }
+        if (maxDist > 0.0f) {
+            for (i in 0 until SAMPLING_POINTS) {
+                pointWeights[i] = 0.5f + pointWeights[i] / maxDist
+            }
+        } else {
+            pointWeights.fill(1.0f)
+        }
 
         for (i in remainingWords.indices) {
             val word = remainingWords[i]
@@ -215,8 +244,8 @@ class StatisticalGlideTypingClassifier(context: Context) : GlideTypingClassifier
             for (idealGesture in idealGestures) {
                 val wordGesture = idealGesture.resample(SAMPLING_POINTS)
                 val normalizedGesture: Gesture = wordGesture.normalizeByBoxSide()
-                val shapeDistance = calcShapeDistance(normalizedGesture, normalizedUserGesture)
-                val locationDistance = calcLocationDistance(wordGesture, userGesture)
+                val shapeDistance = calcShapeDistance(normalizedGesture, normalizedUserGesture, pointWeights)
+                val locationDistance = calcLocationDistance(wordGesture, userGesture, pointWeights)
                 val shapeProbability = calcGaussianProbability(shapeDistance, 0.0f, SHAPE_STD)
                 val locationProbability = calcGaussianProbability(locationDistance, 0.0f, LOCATION_STD * radius)
                 val frequency = 255f * nlpManager.getFrequencyForWord(currentSubtype!!, word).toFloat()
@@ -254,17 +283,66 @@ class StatisticalGlideTypingClassifier(context: Context) : GlideTypingClassifier
         gesture.clear()
     }
 
-    private fun calcLocationDistance(gesture1: Gesture, gesture2: Gesture): Float {
+    /**
+     * Decodes the raw gesture trail into a letter sequence without consulting
+     * the word pool: nearest key per sampled point, consecutive duplicates
+     * collapsed. This is the OOV fallback — words missing from the pool
+     * (names, slang, loanwords) can never win geometric scoring, so the
+     * literal trail is the best commit candidate. Returns null when no
+     * sane word-shape exists (too short or no letter keys hit).
+     */
+    fun decodeTrailLetters(): String? {
+        if (gesture.isEmpty || keys.isEmpty()) return null
+        val sampled = gesture.resample(SAMPLING_POINTS)
+        val sb = StringBuilder()
+        var lastCode = -1
+        for (i in 0 until SAMPLING_POINTS) {
+            val x = sampled.getX(i)
+            val y = sampled.getY(i)
+            var best: TextKey? = null
+            var bestD = Float.MAX_VALUE
+            for (key in keys) {
+                val c = key.visibleBounds.center
+                val dx = c.x - x
+                val dy = c.y - y
+                val d = dx * dx + dy * dy
+                if (d < bestD) {
+                    bestD = d
+                    best = key
+                }
+            }
+            val code = (best?.data as? TextKeyData)?.code ?: continue
+            if (code <= 0 || code > 0x10FFFF) {
+                lastCode = -1
+                continue
+            }
+            val ch = Character.toChars(code)[0].lowercaseChar()
+            if (!ch.isLetter()) {
+                // Symbol/space keys break the run but don't abort the decode.
+                lastCode = -1
+                continue
+            }
+            if (code == lastCode) continue
+            sb.append(ch)
+            lastCode = code
+        }
+        val word = sb.toString()
+        return word.takeIf { it.length >= 2 }
+    }
+
+    private fun calcLocationDistance(gesture1: Gesture, gesture2: Gesture, weights: FloatArray): Float {
         var totalDistance = 0.0f
+        var weightSum = 0.0f
         for (i in 0 until SAMPLING_POINTS) {
             val x1 = gesture1.getX(i)
             val x2 = gesture2.getX(i)
             val y1 = gesture1.getY(i)
             val y2 = gesture2.getY(i)
             val distance = abs(x1 - x2) + abs(y1 - y2)
-            totalDistance += distance
+            totalDistance += weights[i] * distance
+            weightSum += weights[i]
         }
-        return totalDistance / SAMPLING_POINTS / 2
+        return if (weightSum > 0.0f) totalDistance / weightSum / 2 else 0.0f
     }
 
     private fun calcGaussianProbability(value: Float, mean: Float, standardDeviation: Float): Float {
@@ -274,18 +352,23 @@ class StatisticalGlideTypingClassifier(context: Context) : GlideTypingClassifier
         return probability.toFloat()
     }
 
-    private fun calcShapeDistance(gesture1: Gesture, gesture2: Gesture): Float {
+    private fun calcShapeDistance(gesture1: Gesture, gesture2: Gesture, weights: FloatArray): Float {
+        // NOTE: returns the weighted SUM (scaled by SAMPLING_POINTS, like the
+        // old unweighted sum) — not the average — because SHAPE_STD is tuned
+        // for that scale. With uniform weights this is exactly the old value.
         var distance: Float
         var totalDistance = 0.0f
+        var weightSum = 0.0f
         for (i in 0 until SAMPLING_POINTS) {
             val x1 = gesture1.getX(i)
             val x2 = gesture2.getX(i)
             val y1 = gesture1.getY(i)
             val y2 = gesture2.getY(i)
             distance = Gesture.distance(x1, y1, x2, y2)
-            totalDistance += distance
+            totalDistance += weights[i] * distance
+            weightSum += weights[i]
         }
-        return totalDistance
+        return if (weightSum > 0.0f) totalDistance / weightSum * SAMPLING_POINTS else 0.0f
     }
 
     class Pruner(
