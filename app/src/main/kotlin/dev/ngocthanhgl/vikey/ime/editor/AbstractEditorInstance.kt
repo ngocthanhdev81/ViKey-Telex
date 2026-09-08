@@ -63,6 +63,13 @@ abstract class AbstractEditorInstance(context: Context) {
         private const val NumCharsAfterCursor: Int = 128
         private const val NumCharsSafeMarginBeforeCursor: Int = 128
         //private const val NumCharsSafeMarginAfterCursor: Int = 0
+        /**
+         * Consecutive no-match selection updates after which the optimistic
+         * queue is assumed stranded (app will never echo) and drained so the
+         * next fallthrough resyncs from real editor text. Tuning const: lower
+         * recovers faster from a dead editor, higher tolerates longer app lag.
+         */
+        private const val NO_MATCH_RESYNC_THRESHOLD = 10
 
         private const val CursorUpdateAll: Int =
             InputConnection.CURSOR_UPDATE_MONITOR or InputConnection.CURSOR_UPDATE_IMMEDIATE
@@ -113,6 +120,13 @@ abstract class AbstractEditorInstance(context: Context) {
      * corruption is reported (future: debug overlay).
      */
     private val commitBreadcrumbs = ArrayDeque<String>()
+    /**
+     * CONSECUTIVE (not cumulative) count of selection updates that matched no
+     * queued entry: reset to 0 on every match and on [reset]. At
+     * [NO_MATCH_RESYNC_THRESHOLD] the queue is assumed stranded and drained so
+     * editing recovers without a field restart. Diagnostic: persistently high
+     * values implicate a non-echoing app, not the composer.
+     */
     @Volatile
     var noMatchSelectionUpdates = 0
         private set
@@ -206,6 +220,7 @@ abstract class AbstractEditorInstance(context: Context) {
         }
 
         _lastCommitPosition.handleUpdateSelection(newSelection)
+        runBlocking { expectedContentQueue.dropStaleOlderThan(SystemClock.uptimeMillis()) }
         val expected = runBlocking {
             expectedContentQueue.popUntilOrNull {
                 it.selection == newSelection && it.composing == composing &&
@@ -213,6 +228,8 @@ abstract class AbstractEditorInstance(context: Context) {
             }
         }
         if (expected != null) {
+            // Consecutive semantics: a match proves the app is echoing again.
+            noMatchSelectionUpdates = 0
             activeCursorCapsMode = expected.cursorCapsMode()
             activeContent = expected
             keyboardManager.reevaluateInputShiftState()
@@ -228,6 +245,17 @@ abstract class AbstractEditorInstance(context: Context) {
         noMatchSelectionUpdates++
         flogDebug(EDITOR_INSTANCE) {
             "selection update matched no queued entry (new=$newSelection composing=$composing)"
+        }
+        if (noMatchSelectionUpdates >= NO_MATCH_RESYNC_THRESHOLD) {
+            // Stranded queue: the app has not echoed for many consecutive
+            // updates, so it never will. Drain and let the fallthrough below
+            // resync from real editor text (its F2 re-check passes on an
+            // empty queue). This recovers total Telex death without a field
+            // restart; rm computed against real text cannot over-delete.
+            runBlocking { expectedContentQueue.clear() }
+            flogDebug(EDITOR_INSTANCE) {
+                "drained stranded queue after $noMatchSelectionUpdates consecutive no-matches (new=$newSelection)"
+            }
         }
         scope.launch {
             // Re-check before clobbering: optimistic entries may have been pushed
@@ -268,6 +296,7 @@ abstract class AbstractEditorInstance(context: Context) {
         activeInfo = FlorisEditorInfo.Unspecified
         activeCursorCapsMode = InputAttributes.CapsMode.NONE
         activeContent = EditorContent.Unspecified
+        noMatchSelectionUpdates = 0
         runBlocking { expectedContentQueue.clear() }
         _lastCommitPosition.reset()
     }
@@ -847,7 +876,7 @@ abstract class AbstractEditorInstance(context: Context) {
     }
 
     private class ExpectedContentQueue {
-        private val list = guardedByLock { mutableListOf<EditorContent>() }
+        private val entries = guardedByLock { ArrayDeque<Pair<EditorContent, Long>>() }
 
         companion object {
             /**
@@ -855,6 +884,30 @@ abstract class AbstractEditorInstance(context: Context) {
              * limit. Only evicted when no entry matches (see below).
              */
             private const val MAX_ENTRIES = 32
+            /**
+             * Age after which an un-echoed entry is assumed never to be echoed
+             * (normal echoes arrive in milliseconds) and dropped. Tuning const:
+             * higher tolerates laggier apps, lower recovers faster. Dropping
+             * only stale entries never harms fast typing: fresh optimistic
+             * state is always kept.
+             */
+            private const val ENTRY_TTL_MS = 1500L
+        }
+
+        /**
+         * Drops entries older than [ENTRY_TTL_MS]. Entries are pushed
+         * chronologically so stale ones are always at the front. Returns the
+         * number of dropped entries.
+         */
+        suspend fun dropStaleOlderThan(nowMs: Long = SystemClock.uptimeMillis()): Int {
+            return entries.withLock { queue ->
+                var dropped = 0
+                while (queue.isNotEmpty() && nowMs - queue.first().second > ENTRY_TTL_MS) {
+                    queue.removeFirst()
+                    dropped++
+                }
+                dropped
+            }
         }
 
         /**
@@ -866,22 +919,25 @@ abstract class AbstractEditorInstance(context: Context) {
          * wrong rm/text, e.g. "và" becoming "vvf").
          *
          * If nothing matches, NOTHING is dropped (previous behavior drained
-         * the whole queue here) — only the memory cap is enforced.
+         * the whole queue here) — only the memory cap is enforced. Stale
+         * entries are evicted separately by [dropStaleOlderThan] so a silent
+         * editor cannot pin `activeContent` forever (total Telex death until
+         * field restart).
          */
         suspend fun popUntilOrNull(predicate: (EditorContent) -> Boolean): EditorContent? {
-            return list.withLock { list ->
-                val idx = list.indexOfFirst(predicate)
+            return entries.withLock { queue ->
+                val idx = queue.indexOfFirst { (content, _) -> predicate(content) }
                 if (idx < 0) {
                     var evicted = 0
-                    while (list.size > MAX_ENTRIES) {
-                        list.removeAt(0)
+                    while (queue.size > MAX_ENTRIES) {
+                        queue.removeFirst()
                         evicted++
                     }
                     capEvictions += evicted
                     return@withLock null
                 }
-                repeat(idx) { list.removeAt(0) }
-                return@withLock list.removeAt(0)
+                repeat(idx) { queue.removeFirst() }
+                return@withLock queue.removeFirst().first
             }
         }
 
@@ -889,26 +945,26 @@ abstract class AbstractEditorInstance(context: Context) {
             private set
 
         suspend fun push(item: EditorContent) {
-            list.withLock { list ->
-                list.add(item)
+            entries.withLock { queue ->
+                queue.add(item to SystemClock.uptimeMillis())
             }
         }
 
         suspend fun peekNewestOrNull(): EditorContent? {
-            return list.withLock { list ->
-                list.lastOrNull()
+            return entries.withLock { queue ->
+                queue.lastOrNull()?.first
             }
         }
 
         suspend fun size(): Int {
-            return list.withLock { list ->
-                list.size
+            return entries.withLock { queue ->
+                queue.size
             }
         }
 
         suspend fun clear() {
-            list.withLock { list ->
-                list.clear()
+            entries.withLock { queue ->
+                queue.clear()
             }
         }
     }
