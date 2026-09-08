@@ -107,6 +107,15 @@ class NlpManager(context: Context) {
     }
 
     /**
+     * Drops the in-progress composition WITHOUT learning it. Use at word
+     * boundaries where the completed word is recorded through another path
+     * (suggestion accept, autocorrect commit) or was deleted by the user.
+     */
+    fun discardPendingCompletion() {
+        pendingCompletion = null
+    }
+
+    /**
      * Tracks the in-progress composition so that when a word boundary arrives
      * (whitespace via [clearCompositionState] or a punctuation keystroke) the just
      * completed word can be learned into the personal dictionary and bigram model.
@@ -502,13 +511,19 @@ class NlpManager(context: Context) {
         }
     }
 
+    /**
+     * Explicitly learns one already-completed word (glide commit path).
+     * Async on IO like [flushPendingCompletion]; never blocks the input thread.
+     */
     fun learnWord(word: String) {
-        runBlocking {
-            val subtype = subtypeManager.activeSubtype
+        if (word.length < 2 || keyboardManager.activeState.isIncognitoMode) return
+        val subtype = subtypeManager.activeSubtype
+        val lc = word.lowercase(Locale.ROOT)
+        scope.launch(Dispatchers.IO) {
             val provider = getSuggestionProvider(subtype)
             when (provider) {
-                is EnglishSuggestionProvider -> provider.recordWord(word)
-                is VietnameseLanguageProvider -> provider.recordWord(word)
+                is EnglishSuggestionProvider -> provider.recordWord(lc)
+                is VietnameseLanguageProvider -> provider.recordWord(lc)
                 else -> {}
             }
         }

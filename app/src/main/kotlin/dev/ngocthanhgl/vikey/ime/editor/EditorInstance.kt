@@ -421,6 +421,8 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
      * @return True on success, false if an error occurred or the input connection is invalid.
      */
     fun deleteBackwards(unit: OperationUnit): Boolean {
+        // Deleted text must not be learned; the next keystroke re-seeds pending.
+        nlpManager.discardPendingCompletion()
         val content = activeContent
         val undo = lastAutocorrectUndo
         if (undo != null) {
@@ -590,11 +592,14 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
     fun performEnter(): Boolean {
         autoSpace.setInactive()
         phantomSpace.setInactive()
+        // Enter ends the typed word: learn it into the personal dictionary.
+        nlpManager.clearCompositionState()
         return if (activeInfo.isRawInputEditor) {
-            sendDownUpKeyEvent(KeyEvent.KEYCODE_ENTER)
+            sendDownUpKeyEvent(KeyCode.KEYCODE_ENTER)
         } else {
             commitText("\n")
         }
+    }
     }
 
     fun tryPerformEnterCommitRaw(): Boolean {
@@ -615,6 +620,8 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
     fun performEnterAction(action: ImeOptions.Action): Boolean {
         autoSpace.setInactive()
         phantomSpace.setInactive()
+        // Submitting ends the typed word: learn it into the personal dictionary.
+        nlpManager.clearCompositionState()
         val ic = currentInputConnection() ?: return false
         return ic.performEditorAction(action.toInt())
     }

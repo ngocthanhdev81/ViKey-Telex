@@ -290,9 +290,13 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
             is ClipboardSuggestionCandidate -> editorInstance.commitClipboardItem(candidate.clipboardItem)
             else -> editorInstance.commitCompletion(candidate)
         }
+        // Accepted word is recorded via notifySuggestionAccepted; drop the typed
+        // prefix without learning it again (avoids polluting personal dict).
+        nlpManager.discardPendingCompletion()
     }
 
     fun commitGesture(word: String) {
+        nlpManager.learnWord(word)
         editorInstance.commitGesture(fixCase(word))
     }
 
@@ -536,10 +540,12 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
      */
     fun handleHardwareKeyboardSpace() {
         val candidate = nlpManager.getAutoCommitCandidate()
-        candidate?.let { commitCandidate(it) }
-        // Skip handling changing to characters keyboard and double space periods
-        // commitCompletion already added trailing space when candidate was committed
-        if (candidate == null) {
+        if (candidate != null) {
+            commitCandidate(candidate)
+            nlpManager.discardPendingCompletion()
+        } else {
+            // Space ends the typed word: learn it into the personal dictionary.
+            nlpManager.clearCompositionState()
             editorInstance.commitText(KeyCode.SPACE.toChar().toString())
         }
     }
@@ -550,7 +556,12 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
      */
     private fun handleSpace(data: KeyData) {
         val candidate = nlpManager.getAutoCommitCandidate()
-        candidate?.let { commitCandidate(it) }
+        if (candidate != null) {
+            commitCandidate(candidate)
+            // Accepted word is recorded via notifySuggestionAccepted; drop the
+            // typed prefix without learning it again.
+            nlpManager.discardPendingCompletion()
+        }
         if (prefs.keyboard.spaceBarSwitchesToCharacters.get()) {
             when (activeState.keyboardMode) {
                 KeyboardMode.NUMERIC_ADVANCED,
@@ -575,6 +586,8 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
         }
         // commitCompletion already added trailing space when candidate was committed
         if (candidate == null) {
+            // Space ends the typed word: learn it into the personal dictionary.
+            nlpManager.clearCompositionState()
             editorInstance.commitText(KeyCode.SPACE.toChar().toString())
         }
     }
