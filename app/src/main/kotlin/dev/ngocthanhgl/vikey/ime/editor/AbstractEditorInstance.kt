@@ -28,6 +28,8 @@ import dev.ngocthanhgl.vikey.FlorisImeService
 import dev.ngocthanhgl.vikey.ime.nlp.BreakIteratorGroup
 import dev.ngocthanhgl.vikey.ime.text.composing.Composer
 import dev.ngocthanhgl.vikey.keyboardManager
+import dev.ngocthanhgl.vikey.lib.devtools.LogTopic.EDITOR_INSTANCE
+import dev.ngocthanhgl.vikey.lib.devtools.flogDebug
 import dev.ngocthanhgl.vikey.lib.ext.ExtensionComponentName
 import dev.ngocthanhgl.vikey.nlpManager
 import dev.ngocthanhgl.vikey.subtypeManager
@@ -104,6 +106,25 @@ abstract class AbstractEditorInstance(context: Context) {
             _activeContentFlow.value = v
         }
     private val expectedContentQueue = ExpectedContentQueue()
+    /**
+     * Debug breadcrumbs for intermittent editor-state races (e.g. typed "và"
+     * rarely becoming "vvf"). Tiny ring buffer, always on: one short string
+     * per commit, negligible cost. Dump via [getCommitBreadcrumbs] when a
+     * corruption is reported (future: debug overlay).
+     */
+    private val commitBreadcrumbs = ArrayDeque<String>()
+    @Volatile
+    var noMatchSelectionUpdates = 0
+        private set
+    val queueCapEvictions: Int
+        get() = runBlocking { expectedContentQueue.capEvictions }
+
+    fun noteCommitBreadcrumb(msg: String) {
+        if (commitBreadcrumbs.size >= 50) commitBreadcrumbs.removeFirst()
+        commitBreadcrumbs.addLast("${SystemClock.uptimeMillis()}: $msg")
+    }
+
+    fun getCommitBreadcrumbs(): List<String> = commitBreadcrumbs.toList()
     private val _lastCommitPosition = LastCommitPosition()
     val lastCommitPosition
         get() = LastCommitPosition(_lastCommitPosition)
@@ -204,7 +225,20 @@ abstract class AbstractEditorInstance(context: Context) {
         val textAfterSelection = ic.getTextAfterCursor(NumCharsAfterCursor, 0) ?: ""
         val selectedText = if (newSelection.isSelectionMode) ic.getSelectedText(0) ?: "" else ""
 
+        noMatchSelectionUpdates++
+        flogDebug(EDITOR_INSTANCE) {
+            "selection update matched no queued entry (new=$newSelection composing=$composing)"
+        }
         scope.launch {
+            // Re-check before clobbering: optimistic entries may have been pushed
+            // after the IPC read above (fast typing + lag). The editor text just
+            // read can be pre-commit (stale), so never overwrite newer queue state.
+            if (runBlocking { expectedContentQueue.peekNewestOrNull() } != null) {
+                flogDebug(EDITOR_INSTANCE) {
+                    "skipping flow set, queue holds newer entries (new=$newSelection)"
+                }
+                return@launch
+            }
             val content = generateContent(
                 editorInfo,
                 newSelection,
@@ -427,6 +461,10 @@ abstract class AbstractEditorInstance(context: Context) {
                     selectedText = "",
                 )
                 expectedContentQueue.push(newContent)
+                noteCommitBreadcrumb(
+                    "commitChar prevTail='${previous.takeLast(8)}' ch='$char' rm=$rm " +
+                        "text='$finalText' qdepth=${expectedContentQueue.size()}"
+                )
             }
             try {
                 ic.beginBatchEdit()
@@ -466,6 +504,10 @@ abstract class AbstractEditorInstance(context: Context) {
                 selectedText = "",
             )
             expectedContentQueue.push(newContent)
+            noteCommitBreadcrumb(
+                "commitText prevTail='${content.textBeforeSelection.takeLast(8)}' " +
+                    "text='$text' qdepth=${expectedContentQueue.size()}"
+            )
         }
         try {
             ic.beginBatchEdit()
@@ -807,15 +849,44 @@ abstract class AbstractEditorInstance(context: Context) {
     private class ExpectedContentQueue {
         private val list = guardedByLock { mutableListOf<EditorContent>() }
 
+        companion object {
+            /**
+             * Upper bound so a dead/silent editor cannot grow the queue without
+             * limit. Only evicted when no entry matches (see below).
+             */
+            private const val MAX_ENTRIES = 32
+        }
+
+        /**
+         * Returns the first entry matching [predicate], dropping only entries
+         * OLDER than the match. Entries NEWER than the match are kept: system
+         * selection updates can arrive duplicated or out of order (lag, batch
+         * boundaries, apps not honoring batch edits), and discarding newer
+         * optimistic state corrupts the next keystroke (stale `previous` →
+         * wrong rm/text, e.g. "và" becoming "vvf").
+         *
+         * If nothing matches, NOTHING is dropped (previous behavior drained
+         * the whole queue here) — only the memory cap is enforced.
+         */
         suspend fun popUntilOrNull(predicate: (EditorContent) -> Boolean): EditorContent? {
             return list.withLock { list ->
-                while (list.isNotEmpty()) {
-                    val item = list.removeAt(0)
-                    if (predicate(item)) return@withLock item
+                val idx = list.indexOfFirst(predicate)
+                if (idx < 0) {
+                    var evicted = 0
+                    while (list.size > MAX_ENTRIES) {
+                        list.removeAt(0)
+                        evicted++
+                    }
+                    capEvictions += evicted
+                    return@withLock null
                 }
-                return@withLock null
+                repeat(idx) { list.removeAt(0) }
+                return@withLock list.removeAt(0)
             }
         }
+
+        var capEvictions = 0
+            private set
 
         suspend fun push(item: EditorContent) {
             list.withLock { list ->
@@ -826,6 +897,12 @@ abstract class AbstractEditorInstance(context: Context) {
         suspend fun peekNewestOrNull(): EditorContent? {
             return list.withLock { list ->
                 list.lastOrNull()
+            }
+        }
+
+        suspend fun size(): Int {
+            return list.withLock { list ->
+                list.size
             }
         }
 
