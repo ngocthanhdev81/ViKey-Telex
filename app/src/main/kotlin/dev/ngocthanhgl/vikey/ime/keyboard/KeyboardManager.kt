@@ -46,6 +46,8 @@ import dev.ngocthanhgl.vikey.ime.input.InputShiftState
 import dev.ngocthanhgl.vikey.ime.nlp.ClipboardSuggestionCandidate
 import dev.ngocthanhgl.vikey.ime.nlp.PunctuationRule
 import dev.ngocthanhgl.vikey.ime.nlp.SuggestionCandidate
+import dev.ngocthanhgl.vikey.ime.nlp.WordSuggestionCandidate
+import dev.ngocthanhgl.vikey.ime.nlp.ngramTokens
 import dev.ngocthanhgl.vikey.ime.popup.PopupMappingComponent
 import dev.ngocthanhgl.vikey.ime.text.composing.Composer
 import dev.ngocthanhgl.vikey.ime.text.gestures.SwipeAction
@@ -283,6 +285,14 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
     }
 
     fun commitCandidate(candidate: SuggestionCandidate) {
+        // Capture N-gram history BEFORE the commit mutates the editor. When
+        // tapping a completion, the last token is the typed prefix being
+        // replaced; when tapping a next-word prediction the cursor is already
+        // past a boundary, so the full token list is the context.
+        val textBefore = editorInstance.activeContent.textBeforeSelection
+        val tokens = ngramTokens(textBefore)
+        val atBoundary = textBefore.lastOrNull()?.isWhitespace() == true
+        val acceptedHistory = (if (atBoundary) tokens else tokens.dropLast(1)).takeLast(2)
         scope.launch {
             candidate.sourceProvider?.notifySuggestionAccepted(subtypeManager.activeSubtype, candidate)
         }
@@ -293,10 +303,13 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
         // Accepted word is recorded via notifySuggestionAccepted; drop the typed
         // prefix without learning it again (avoids polluting personal dict).
         nlpManager.discardPendingCompletion()
+        if (candidate is WordSuggestionCandidate) {
+            nlpManager.learnWord(candidate.text.toString(), acceptedHistory, skipWordRecord = true)
+        }
     }
 
-    fun commitGesture(word: String) {
-        nlpManager.learnWord(word)
+    fun commitGesture(word: String, history: List<String> = emptyList()) {
+        nlpManager.learnWord(word, history)
         editorInstance.commitGesture(fixCase(word))
     }
 

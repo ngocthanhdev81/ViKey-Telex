@@ -80,8 +80,13 @@ class NlpManager(context: Context) {
     private var lastShiftSeen: dev.ngocthanhgl.vikey.ime.input.InputShiftState? = null
     @Volatile
     private var pendingCompletion: String? = null
-    @Volatile
-    private var lastCompletedWord: String? = null
+    /** Last 2 fully completed words (oldest first): N-gram learning history. */
+    private val completedHistory = ArrayDeque<String>(2)
+
+    private fun pushCompleted(word: String) {
+        if (completedHistory.size >= 2) completedHistory.removeFirst()
+        completedHistory.addLast(word)
+    }
 
     fun hasPendingCompositionSuggestion(): Boolean = hasPendingComposition
 
@@ -143,16 +148,22 @@ class NlpManager(context: Context) {
         pendingCompletion = null
         if (word.length < 2 || keyboardManager.activeState.isIncognitoMode) return
         val subtype = subtypeManager.activeSubtype
+        val history = completedHistory.toList()
         scope.launch(Dispatchers.IO) {
             when (val provider = getSuggestionProvider(subtype)) {
                 is VietnameseLanguageProvider -> {
                     provider.recordWord(word)
-                    lastCompletedWord?.let { provider.recordBigram(it, word) }
+                    if (history.isNotEmpty()) provider.recordBigram(history.last(), word)
+                    if (history.size >= 2) provider.recordTrigram(history[0], history[1], word)
                 }
-                is EnglishSuggestionProvider -> provider.recordWord(word)
+                is EnglishSuggestionProvider -> {
+                    provider.recordWord(word)
+                    if (history.isNotEmpty()) provider.recordBigram(history.last(), word)
+                    if (history.size >= 2) provider.recordTrigram(history[0], history[1], word)
+                }
                 else -> {}
             }
-            lastCompletedWord = word
+            pushCompleted(word)
         }
     }
 
@@ -306,6 +317,10 @@ class NlpManager(context: Context) {
         lastPrefix = prefix
         lastShiftSeen = shiftState
         noteCompositionProgress(prefix)
+        // `prefix` is the locally reconstructed full text (history + in-progress
+        // word); the last token is the composition itself, everything before it
+        // is N-gram history for the hot path.
+        val history = ngramTokens(prefix).dropLast(1).takeLast(2)
         val reqTime = SystemClock.uptimeMillis()
         hasPendingComposition = true
         // KeyboardManager resets inputShiftState right after each keystroke; the resulting
@@ -316,7 +331,7 @@ class NlpManager(context: Context) {
             currentShiftState = shiftState
             val suggestions = getSuggestionProvider(subtype).suggest(
                 subtype = subtype,
-                content = EditorContent.compositionPrefix(prefix),
+                content = EditorContent.compositionPrefix(prefix, history),
                 maxCandidateCount = 8,
                 allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
                 isPrivateSession = keyboardManager.activeState.isIncognitoMode,
@@ -512,20 +527,35 @@ class NlpManager(context: Context) {
     }
 
     /**
-     * Explicitly learns one already-completed word (glide commit path).
-     * Async on IO like [flushPendingCompletion]; never blocks the input thread.
+     * Explicitly learns one already-completed word (glide commit and suggestion
+     * tap paths). Records the word itself plus bigram/trigram observations
+     * against [history] (up to 2 preceding words, oldest first). Async on IO
+     * like [flushPendingCompletion]; never blocks the input thread.
+     *
+     * @param skipWordRecord Set when the caller already recorded the word
+     *  itself (e.g. via notifySuggestionAccepted) to avoid double counting.
      */
-    fun learnWord(word: String) {
+    fun learnWord(word: String, history: List<String> = emptyList(), skipWordRecord: Boolean = false) {
         if (word.length < 2 || keyboardManager.activeState.isIncognitoMode) return
         val subtype = subtypeManager.activeSubtype
         val lc = word.lowercase(Locale.ROOT)
+        val hist = history.takeLast(2)
         scope.launch(Dispatchers.IO) {
             val provider = getSuggestionProvider(subtype)
             when (provider) {
-                is EnglishSuggestionProvider -> provider.recordWord(lc)
-                is VietnameseLanguageProvider -> provider.recordWord(lc)
+                is EnglishSuggestionProvider -> {
+                    if (!skipWordRecord) provider.recordWord(lc)
+                    if (hist.isNotEmpty()) provider.recordBigram(hist.last(), lc)
+                    if (hist.size >= 2) provider.recordTrigram(hist[0], hist[1], lc)
+                }
+                is VietnameseLanguageProvider -> {
+                    if (!skipWordRecord) provider.recordWord(lc)
+                    if (hist.isNotEmpty()) provider.recordBigram(hist.last(), lc)
+                    if (hist.size >= 2) provider.recordTrigram(hist[0], hist[1], lc)
+                }
                 else -> {}
             }
+            pushCompleted(lc)
         }
     }
 
@@ -539,7 +569,7 @@ class NlpManager(context: Context) {
                     allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
                     isPrivateSession = keyboardManager.activeState.isIncognitoMode,
                 ).ifEmpty {
-                    val recased = internalSuggestions.get().second.map { candidate ->
+                    internalSuggestions.get().second.map { candidate ->
                         if (candidate is WordSuggestionCandidate) {
                             val st = candidate.shiftState ?: currentShiftState
                             candidate.copy(
@@ -548,40 +578,12 @@ class NlpManager(context: Context) {
                             )
                         } else candidate
                     }
-                    applyBigramContextBoost(recased)
                 }
             }
             else -> emptyList()
         }
         activeCandidates = candidates
         autoExpandCollapseSmartbarActions(candidates.isNotEmpty())
-    }
-
-    /**
-     * Re-ranks word candidates using the bigram model against the word preceding the
-     * one being typed, so contextually natural continuations float to the top. The
-     * second-to-last token of textBeforeSelection is used because the last token is
-     * the in-progress composition itself.
-     */
-    private suspend fun applyBigramContextBoost(
-        candidates: List<SuggestionCandidate>,
-    ): List<SuggestionCandidate> {
-        if (candidates.none { it is WordSuggestionCandidate && it.confidence < 1.0 }) return candidates
-        val tokens = editorInstance.activeContent.textBeforeSelection
-            .split(Regex("[\\s\\p{Punct}]+"))
-            .filter { it.length >= 2 && it[0].isLetter() }
-        val prevWord = tokens.getOrNull(tokens.size - 2) ?: return candidates
-        val provider = getSuggestionProvider(subtypeManager.activeSubtype)
-        return candidates
-            .map { candidate ->
-                if (candidate is WordSuggestionCandidate && candidate.confidence < 1.0) {
-                    val boost = provider.getBigramFrequencyFor(prevWord, candidate.text.toString())
-                    candidate.copy(confidence = (candidate.confidence * (1.0 + 0.6 * boost)).coerceAtMost(0.995))
-                } else {
-                    candidate
-                }
-            }
-            .sortedByDescending { it.confidence }
     }
 
     /**

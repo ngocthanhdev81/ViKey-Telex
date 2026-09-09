@@ -9,6 +9,8 @@ import dev.ngocthanhgl.vikey.ime.nlp.SpellingResult
 import dev.ngocthanhgl.vikey.ime.nlp.SuggestionCandidate
 import dev.ngocthanhgl.vikey.ime.nlp.SuggestionProvider
 import dev.ngocthanhgl.vikey.ime.nlp.WordSuggestionCandidate
+import dev.ngocthanhgl.vikey.ime.nlp.isWordBoundary
+import dev.ngocthanhgl.vikey.ime.nlp.ngramHistory
 import dev.ngocthanhgl.vikey.lib.devtools.flogDebug
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,14 +37,28 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         private const val PREFIX_INDEX_MAX_LENGTH = 6
         private const val PERSONAL_DATA_FILE = "vietnamese_user_data.json"
         private const val BIGRAM_MAX_ENTRIES = 4096
+        private const val TRIGRAM_MAX_ENTRIES = 4096
         private const val PERSONAL_BOOST_WEIGHT = 0.5
+
+        /**
+         * Stupid-backoff penalty per backed-off level: trigram miss costs one
+         * 0.4x, falling all the way to unigram costs 0.4^2. Standard value.
+         */
+        private const val BACKOFF_WEIGHT = 0.4
+
+        /**
+         * How much one personal observation counts against static corpus
+         * counts. Personal data is sparse but highly specific to the user, so
+         * a few repetitions must visibly move rankings without nuking the
+         * cold-start static model.
+         */
+        private const val USER_OBS_WEIGHT = 8.0
 
         // Geometric-rank prior for glide rerank fusion (see
         // rerankGlideSuggestions): bigram evidence lives in [0, 1], so a
         // prior of 1.0 keeps geometry primary while letting strong context
         // promote within the top ranks.
         private const val GEO_PRIOR = 1.0
-        private const val BIGRAM_SMOOTHING_K = 6.0
 
         /**
          * Fold a Vietnamese word to its toneless ASCII skeleton so toneless input
@@ -67,14 +83,6 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         }
 
         private data class DictEntry(val word: String, val freq: Int)
-
-        private data class ScoredWord(val word: String, val corpusFreq: Int, val personalCount: Int) {
-            fun blendedScore(maxFreq: Long): Double {
-                val normCorpus = if (maxFreq > 0) ln(1.0 + corpusFreq) / ln(1.0 + maxFreq) else 0.0
-                val normPersonal = (personalCount.coerceAtMost(25)) / 25.0
-                return normCorpus + PERSONAL_BOOST_WEIGHT * normPersonal
-            }
-        }
     }
 
     private val appContext by context.appContext()
@@ -103,6 +111,15 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
     private val personalWords = LinkedHashMap<String, Int>()
     /** key = "prev|next" on folded lowercase forms; insertion-ordered for eviction. */
     private val bigramCounts = LinkedHashMap<String, Int>()
+    /** key = "w1|w2|w3" on folded lowercase forms; insertion-ordered for eviction. */
+    private val trigramCounts = LinkedHashMap<String, Int>()
+
+    /** Static corpus N-grams shipped in the APK (vi_ngrams.json), same key format. */
+    private val staticBigrams = HashMap<String, Int>()
+    private val staticTrigrams = HashMap<String, Int>()
+    /** Static context totals: prev -> sum, "w1|w2" -> sum (denominators). */
+    private val staticBiTotals = HashMap<String, Int>()
+    private val staticTriTotals = HashMap<String, Int>()
     @Volatile
     private var userDataDirty = false
     private val bgScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -127,14 +144,50 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
                 appContext.assets.readText("ime/dict/vi.json")
             }
             val jsonData = Json.decodeFromString(wordDataSerializer, rawData)
+            val ngramRaw = try {
+                withContext(Dispatchers.IO) {
+                    appContext.assets.readText("ime/dict/vi_ngrams.json")
+                }
+            } catch (e: Exception) {
+                flogDebug { "Failed to load Vietnamese static N-grams: ${e.message}" }
+                null
+            }
             synchronized(dictLock) {
                 if (wordData.isEmpty()) {
                     wordData.putAll(jsonData)
                     rebuildIndexesLocked(jsonData)
                 }
+                if (staticBigrams.isEmpty() && ngramRaw != null) {
+                    loadStaticNgramsLocked(ngramRaw)
+                }
             }
         } catch (e: Exception) {
             flogDebug { "Failed to load Vietnamese dictionary: ${e.message}" }
+        }
+    }
+
+    /** Caller must hold [dictLock]. Parses vi_ngrams.json + precomputes context totals. */
+    private fun loadStaticNgramsLocked(raw: String) {
+        try {
+            val root = JSONObject(raw)
+            val bi = root.optJSONObject("bigrams") ?: JSONObject()
+            for (key in bi.keys()) {
+                val count = bi.optInt(key, 0)
+                if (count <= 0) continue
+                staticBigrams[key] = count
+                val prev = key.substringBefore('|')
+                staticBiTotals[prev] = (staticBiTotals[prev] ?: 0) + count
+            }
+            val tri = root.optJSONObject("trigrams") ?: JSONObject()
+            for (key in tri.keys()) {
+                val count = tri.optInt(key, 0)
+                if (count <= 0) continue
+                staticTrigrams[key] = count
+                val ctx = key.substringBeforeLast('|')
+                staticTriTotals[ctx] = (staticTriTotals[ctx] ?: 0) + count
+            }
+        } catch (e: Exception) {
+            flogDebug { "Failed to load Vietnamese static N-grams: ${e.message}" }
         }
     }
 
@@ -206,12 +259,127 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         userDataDirty = true
     }
 
+    /**
+     * Records a trigram observation. Same folded-lowercase key format as
+     * bigrams ("w1|w2|w3"), same eviction policy.
+     */
+    fun recordTrigram(w1: String, w2: String, w3: String) {
+        val a = foldVietnamese(w1.trim()).lowercase(Locale.ROOT)
+        val b = foldVietnamese(w2.trim()).lowercase(Locale.ROOT)
+        val c = foldVietnamese(w3.trim()).lowercase(Locale.ROOT)
+        if (a.isEmpty() || b.isEmpty() || c.isEmpty()) return
+        if (a.any { !it.isLetter() } || b.any { !it.isLetter() } || c.any { !it.isLetter() }) return
+        synchronized(trigramCounts) {
+            val key = "$a|$b|$c"
+            trigramCounts[key] = (trigramCounts[key] ?: 0) + 1
+            while (trigramCounts.size > TRIGRAM_MAX_ENTRIES) {
+                val eldest = trigramCounts.entries.iterator()
+                eldest.next()
+                eldest.remove()
+            }
+        }
+        userDataDirty = true
+    }
+
+    // ---- Unified N-gram scorer (stupid backoff + personal tiers) ----
+
+    /**
+     * Unigram tier: log-scaled corpus frequency blended with the personal
+     * count, normalized to [0, 1]. Single source of truth for unigram
+     * probability (ranking backoff tier, frequency API, glide consumers).
+     */
+    private fun unigramProb(lowerWord: String): Double {
+        val corpus = synchronized(dictLock) { wordData[lowerWord] ?: 0 }
+        val personal = synchronized(personalWords) { personalWords[lowerWord] ?: 0 }
+        val normCorpus = if (maxFreq > 0) ln(1.0 + corpus) / ln(1.0 + maxFreq) else 0.0
+        val normPersonal = personal.coerceAtMost(25) / 25.0
+        return (normCorpus + PERSONAL_BOOST_WEIGHT * normPersonal) / (1.0 + PERSONAL_BOOST_WEIGHT)
+    }
+
+    private fun userBiCount(key: String): Int {
+        return synchronized(bigramCounts) { bigramCounts[key] ?: 0 }
+    }
+
+    private fun userTriCount(key: String): Int {
+        return synchronized(trigramCounts) { trigramCounts[key] ?: 0 }
+    }
+
+    private fun userBiTotal(ctx: String): Int {
+        val prefix = "$ctx|"
+        return synchronized(bigramCounts) {
+            var total = 0
+            for ((key, count) in bigramCounts) {
+                if (key.startsWith(prefix)) total += count
+            }
+            total
+        }
+    }
+
+    private fun userTriTotal(ctx: String): Int {
+        val prefix = "$ctx|"
+        return synchronized(trigramCounts) {
+            var total = 0
+            for ((key, count) in trigramCounts) {
+                if (key.startsWith(prefix)) total += count
+            }
+            total
+        }
+    }
+
+    /**
+     * P(word | history) with stupid backoff over combined static + personal
+     * tiers: trigram hit → raw MLE; else 0.4 × bigram; else 0.4² × unigram.
+     * Personal observations weigh [USER_OBS_WEIGHT]× so a few repetitions
+     * visibly move rankings without nuking the cold-start static model.
+     *
+     * @param history Up to 2 preceding words (oldest first, any casing).
+     * @param lowerWord Candidate in lowercase (unfolded, matching wordData keys).
+     */
+    fun ngramProb(history: List<String>, lowerWord: String): Double {
+        val foldedHist = history.takeLast(2).map { foldVietnamese(it).lowercase(Locale.ROOT) }
+        val foldedWord = foldVietnamese(lowerWord).lowercase(Locale.ROOT)
+        if (foldedHist.size >= 2) {
+            val ctx = "${foldedHist[0]}|${foldedHist[1]}"
+            val key = "$ctx|$foldedWord"
+            val num = synchronized(dictLock) { staticTrigrams[key] ?: 0 } +
+                USER_OBS_WEIGHT * userTriCount(key)
+            if (num > 0) {
+                val den = synchronized(dictLock) { staticTriTotals[ctx] ?: 0 } +
+                    USER_OBS_WEIGHT * userTriTotal(ctx)
+                if (den > 0) return (num / den).coerceIn(0.0, 1.0)
+            }
+            return BACKOFF_WEIGHT * bigramOrUni(foldedHist[1], foldedWord, lowerWord)
+        }
+        if (foldedHist.size == 1) {
+            return bigramOrUni(foldedHist[0], foldedWord, lowerWord)
+        }
+        return unigramProb(lowerWord)
+    }
+
+    private fun bigramOrUni(ctx: String, foldedWord: String, lowerWord: String): Double {
+        val key = "$ctx|$foldedWord"
+        val num = synchronized(dictLock) { staticBigrams[key] ?: 0 } +
+            USER_OBS_WEIGHT * userBiCount(key)
+        if (num > 0) {
+            val den = synchronized(dictLock) { staticBiTotals[ctx] ?: 0 } +
+                USER_OBS_WEIGHT * userBiTotal(ctx)
+            if (den > 0) return (num / den).coerceIn(0.0, 1.0)
+        }
+        return BACKOFF_WEIGHT * unigramProb(lowerWord)
+    }
+
     override suspend fun getBigramFrequencyFor(prevWord: String, nextWord: String): Double {
         if (prevWord.isBlank() || nextWord.isBlank()) return 0.0
-        val prev = foldVietnamese(prevWord.trim()).lowercase(Locale.ROOT)
+        val ctx = foldVietnamese(prevWord.trim()).lowercase(Locale.ROOT)
         val next = foldVietnamese(nextWord.trim()).lowercase(Locale.ROOT)
-        val count = synchronized(bigramCounts) { bigramCounts["$prev|$next"] ?: 0 }
-        return count / (count + BIGRAM_SMOOTHING_K)
+        val key = "$ctx|$next"
+        val num = synchronized(dictLock) { staticBigrams[key] ?: 0 } +
+            USER_OBS_WEIGHT * userBiCount(key)
+        if (num <= 0) return 0.0
+        val den = synchronized(dictLock) { staticBiTotals[ctx] ?: 0 } +
+            USER_OBS_WEIGHT * userBiTotal(ctx)
+        if (den <= 0) return 0.0
+        return (num / den).coerceIn(0.0, 1.0)
     }
 
     private fun startPeriodicSave() {
@@ -236,6 +404,10 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
             for (key in bigrams.keys()) {
                 bigramCounts[key] = bigrams.optInt(key, 1)
             }
+            val trigrams = root.optJSONObject("trigrams") ?: JSONObject()
+            for (key in trigrams.keys()) {
+                trigramCounts[key] = trigrams.optInt(key, 1)
+            }
         } catch (e: Exception) {
             flogDebug { "Failed to load Vietnamese user data: ${e.message}" }
         }
@@ -255,6 +427,11 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
             }
             root.put("words", words)
             root.put("bigrams", bigrams)
+            val trigrams = JSONObject()
+            synchronized(trigramCounts) {
+                for ((key, count) in trigramCounts) trigrams.put(key, count)
+            }
+            root.put("trigrams", trigrams)
             File(appContext.filesDir, PERSONAL_DATA_FILE).writeText(root.toString())
             userDataDirty = false
         } catch (e: Exception) {
@@ -283,12 +460,19 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         allowPossiblyOffensive: Boolean,
         isPrivateSession: Boolean,
     ): List<SuggestionCandidate> {
+        // At a word boundary (just typed space/punctuation) there is no prefix
+        // to complete: predict the NEXT word from N-gram history instead.
+        if (isWordBoundary(content)) {
+            loadDict()
+            return nextWordCandidates(ngramHistory(content, atBoundary = true), maxCandidateCount)
+        }
         val prefix = getCurrentWord(content)
             ?: return emptyList()
 
         loadDict()
 
         val lowerPrefix = prefix.lowercase(Locale.ROOT)
+        val history = ngramHistory(content, atBoundary = false)
 
         // Pool corpus hits from the prebuilt index...
         val direct = synchronized(dictLock) {
@@ -331,22 +515,76 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
 
         if (pool.isEmpty()) return emptyList()
 
-        // Rank with the personal-count boost layered over corpus frequency.
-        val scored = ArrayList<ScoredWord>(pool.size)
-        for ((lowerWord, corpusFreq) in pool) {
-            scored.add(ScoredWord(lowerWord, corpusFreq, personalSnapshot[lowerWord] ?: 0))
-        }
-        scored.sortByDescending { it.blendedScore(maxFreq) }
+        // Rank by unified P(word | history): contextually natural continuations
+        // float to the top instead of raw unigram frequency order.
+        val ranked = pool.keys
+            .map { lowerWord -> lowerWord to ngramProb(history, lowerWord) }
+            .sortedByDescending { it.second }
 
-        return scored.take(maxCandidateCount).mapIndexed { index, entry ->
-            buildCandidate(prefix, entry.word, entry, index, maxCandidateCount)
+        return ranked.take(maxCandidateCount).mapIndexed { index, (lowerWord, prob) ->
+            buildCandidate(prefix, lowerWord, prob, index, maxCandidateCount)
         }
+    }
+
+    /**
+     * Next-word prediction at a word boundary: top continuations of the last
+     * history word from merged static + personal bigram counts. Committing one
+     * (word + trailing space via the normal candidate path) lands on a new
+     * boundary, so predictions chain like Gboard. Never auto-commit eligible.
+     */
+    private fun nextWordCandidates(history: List<String>, maxCandidateCount: Int): List<SuggestionCandidate> {
+        if (history.isEmpty() || maxCandidateCount <= 0) return emptyList()
+        val ctx = foldVietnamese(history.last()).lowercase(Locale.ROOT)
+        if (ctx.isEmpty()) return emptyList()
+        val combined = HashMap<String, Double>()
+        synchronized(dictLock) {
+            val prefix = "$ctx|"
+            for ((key, count) in staticBigrams) {
+                if (key.startsWith(prefix)) {
+                    val next = key.substring(prefix.length)
+                    combined[next] = (combined[next] ?: 0.0) + count
+                }
+            }
+        }
+        synchronized(bigramCounts) {
+            val prefix = "$ctx|"
+            for ((key, count) in bigramCounts) {
+                if (key.startsWith(prefix)) {
+                    val next = key.substring(prefix.length)
+                    combined[next] = (combined[next] ?: 0.0) + USER_OBS_WEIGHT * count
+                }
+            }
+        }
+        if (combined.isEmpty()) return emptyList()
+        return combined.entries
+            .sortedByDescending { it.value }
+            .take(maxCandidateCount)
+            .mapIndexed { index, (foldedWord, _) ->
+                val prob = ngramProb(history, foldedWord)
+                WordSuggestionCandidate(
+                    text = restoreDictionaryCasing(foldedWord),
+                    confidence = ((prob / (prob + 0.08)) * (1.0 - index.toDouble() / maxCandidateCount))
+                        .coerceIn(0.05, 0.99),
+                    isEligibleForAutoCommit = false,
+                    sourceProvider = this,
+                )
+            }
+    }
+
+    /**
+     * Maps an N-gram probability to candidate confidence. P/(P+0.08) spreads
+     * the typical range (trigram hits ~0.8-0.9, bigram ~0.4-0.6, unigram
+     * backoff ~0.05-0.4) across the confidence band instead of clustering.
+     */
+    private fun probToConfidence(prob: Double, index: Int, maxCandidateCount: Int): Double {
+        return ((prob / (prob + 0.08)) * (1.0 - index.toDouble() / maxCandidateCount))
+            .coerceIn(0.05, 0.99)
     }
 
     private fun buildCandidate(
         prefix: String,
         lowerWord: String,
-        entry: ScoredWord,
+        prob: Double,
         index: Int,
         maxCandidateCount: Int,
     ): SuggestionCandidate {
@@ -354,11 +592,10 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         // Only treat as exact (auto-commit eligible) when the typed prefix matches the
         // dictionary entry character-for-character, including letter case.
         val isExact = restored == prefix
-        val normScore = (entry.blendedScore(maxFreq) / (1.0 + PERSONAL_BOOST_WEIGHT)).coerceIn(0.0, 1.0)
         val confidence = if (isExact) {
             1.0
         } else {
-            (normScore * (1.0 - index.toDouble() / maxCandidateCount)).coerceIn(0.05, 0.99)
+            probToConfidence(prob, index, maxCandidateCount)
         }
         return WordSuggestionCandidate(
             text = applyCasePattern(prefix, restored),
@@ -368,10 +605,16 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
         )
     }
 
-    /** Personal entries are stored lowercase; prefer the corpus's original casing when known. */
+    /**
+     * Personal entries are stored lowercase; prefer the corpus's original casing when known.
+     * Folded skeletons (next-word keys like "khong") resolve through the folded
+     * index to the best original form ("không").
+     */
     private fun restoreDictionaryCasing(lowerWord: String): String {
         val original = synchronized(dictLock) { lowerToOriginal[lowerWord] }
-        return original ?: lowerWord
+        if (original != null) return original
+        val folded = synchronized(dictLock) { foldedIndex[lowerWord]?.firstOrNull() }
+        return folded ?: lowerWord
     }
 
     override suspend fun rerankGlideSuggestions(
@@ -437,15 +680,9 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
     }
 
     override suspend fun getFrequencyForWord(subtype: Subtype, word: String): Double {
-        // Log-scaled normalization keeps this meaningful across the corpus's huge
-        // dynamic range (raw counts span single digits to tens of millions); callers
-        // receive a value in [0, 1] instead of the old saturating count/255 formula.
-        val lc = word.lowercase(Locale.ROOT)
-        val count = synchronized(dictLock) { wordData[lc] ?: wordData[word] ?: 0 }
-        val base = ln(1.0 + count) / ln(1.0 + maxFreq)
-        val personal = synchronized(personalWords) { personalWords[lc] ?: 0 }
-        val boosted = base + 0.35 * (personal.coerceAtMost(20) / 20.0)
-        return boosted.coerceIn(0.0, 1.0)
+        // Single unigram tier shared with the N-gram scorer (previously this
+        // used a different personal weight than ranking — now identical).
+        return unigramProb(word.lowercase(Locale.ROOT)).coerceIn(0.0, 1.0)
     }
 
     override suspend fun destroy() {

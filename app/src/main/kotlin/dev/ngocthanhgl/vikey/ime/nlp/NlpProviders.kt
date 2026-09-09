@@ -260,6 +260,41 @@ interface SuggestionProvider : NlpProvider {
 }
 
 /**
+ * Splits raw text into lowercase letter-only word tokens for N-gram context
+ * and learning (history windows, bigram/trigram keys). Internal apostrophes
+ * survive so English contractions ("don't") stay one token.
+ */
+private val NGRAM_TOKEN_SPLIT = Regex("[\\s\\p{Punct}]+")
+
+fun ngramTokens(text: String): List<String> {
+    return text.split(NGRAM_TOKEN_SPLIT)
+        .filter { it.isNotEmpty() && it.all { c -> c.isLetter() || c == '\'' } }
+        .map { it.lowercase() }
+}
+
+/**
+ * Resolves the up-to-2-word N-gram history for a suggest call. Prefers the
+ * hot-path [EditorContent.contextWords]; otherwise derives from
+ * [EditorContent.textBeforeSelection], dropping the trailing in-progress word
+ * unless [atBoundary] (cursor right after whitespace/punctuation).
+ */
+fun ngramHistory(content: EditorContent, atBoundary: Boolean): List<String> {
+    if (content.contextWords.isNotEmpty()) return content.contextWords.takeLast(2)
+    val tokens = ngramTokens(content.textBeforeSelection)
+    val usable = if (atBoundary) tokens else tokens.dropLast(1)
+    return usable.takeLast(2)
+}
+
+/**
+ * True when the cursor sits right after a word boundary (whitespace or
+ * punctuation): the provider should predict the NEXT word, not complete one.
+ */
+fun isWordBoundary(content: EditorContent): Boolean {
+    val last = content.textBeforeSelection.lastOrNull() ?: return true
+    return last.isWhitespace() || last in ".,;:!?()[]{}\"'«»„“”…—–-/\\@#"
+}
+
+/**
  * Fallback NLP provider which implements all provider variants. Is used in case no other providers can be found.
  */
 object FallbackNlpProvider : SpellingProvider, SuggestionProvider {

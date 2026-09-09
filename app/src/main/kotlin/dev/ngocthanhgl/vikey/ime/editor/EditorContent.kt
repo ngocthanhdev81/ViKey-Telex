@@ -34,6 +34,14 @@ data class EditorContent(
     val localSelection: EditorRange,
     val localComposing: EditorRange,
     val localCurrentWord: EditorRange,
+    /**
+     * Up to 2 fully-typed words preceding the in-progress composition, oldest
+     * first, lowercase. Populated by [compositionPrefix] on the Telex hot path
+     * (where [text] holds only the prefix); empty on paths carrying real editor
+     * text, where providers derive context from [textBeforeSelection] instead.
+     * Feeds the N-gram scorer (`P(word | history)`).
+     */
+    val contextWords: List<String> = emptyList(),
 ) {
     /**
      * The text before the selection as a new string. This may be the whole text before the selection or only a subset,
@@ -111,8 +119,11 @@ data class EditorContent(
         /**
          * Creates an EditorContent from a live Telex composition prefix (no editor IPC needed).
          * Extracts only the last word for correct midword completion.
+         *
+         * @param contextWords Up to 2 fully-typed words preceding the prefix (oldest
+         *  first, lowercase) so the N-gram scorer sees history on the hot path.
          */
-        fun compositionPrefix(fullText: String): EditorContent {
+        fun compositionPrefix(fullText: String, contextWords: List<String> = emptyList()): EditorContent {
             val wordStart = fullText.indexOfLast { it == ' ' } + 1
             val lastWord = fullText.substring(wordStart)
             return EditorContent(
@@ -121,6 +132,7 @@ data class EditorContent(
                 localSelection = EditorRange(lastWord.length, lastWord.length),
                 localComposing = EditorRange(0, lastWord.length),
                 localCurrentWord = EditorRange(0, lastWord.length),
+                contextWords = contextWords.takeLast(2),
             )
         }
     }

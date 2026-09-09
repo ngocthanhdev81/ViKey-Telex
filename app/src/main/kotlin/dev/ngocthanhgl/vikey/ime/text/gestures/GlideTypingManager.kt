@@ -96,6 +96,9 @@ class GlideTypingManager(context: Context) : GlideTypingGesture.Listener {
 
         scope.launch(Dispatchers.Default) {
             val rawSuggestions = glideTypingClassifier.getSuggestions(MAX_SUGGESTION_COUNT, true)
+            val glideHistory = dev.ngocthanhgl.vikey.ime.nlp.ngramTokens(
+                editorInstance.activeContent.textBeforeSelection
+            ).takeLast(2)
             if (rawSuggestions.isEmpty()) {
                 // Pool has no match (OOV: names, slang, loanwords). Fall back to
                 // the literal trail decode so the glide still produces text.
@@ -105,7 +108,7 @@ class GlideTypingManager(context: Context) : GlideTypingGesture.Listener {
                     if (trail != null) {
                         val fixed = keyboardManager.fixCase(trail)
                         nlpManager.suggestDirectly(listOf(WordSuggestionCandidate(fixed, confidence = 1.0)))
-                        if (commit) keyboardManager.commitGesture(fixed)
+                        if (commit) keyboardManager.commitGesture(fixed, glideHistory)
                         callback.invoke(true)
                     } else {
                         callback.invoke(false)
@@ -131,7 +134,7 @@ class GlideTypingManager(context: Context) : GlideTypingGesture.Listener {
 
                 nlpManager.suggestDirectly(suggestionList)
                 if (commit && reranked.isNotEmpty()) {
-                    keyboardManager.commitGesture(reranked.first())
+                    keyboardManager.commitGesture(reranked.first(), glideHistory)
                 }
                 callback.invoke(true)
             }
