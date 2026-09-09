@@ -7,10 +7,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.History
@@ -46,16 +43,6 @@ fun AboutScreen() {
         val navController = LocalNavController.current
         val clipboardManager by context.clipboardManager()
         val appVersion = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
-        // TEMP DEBUG (delete with the export-log commit): SAF export launcher.
-        val exportLog = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-            if (uri == null) return@rememberLauncherForActivityResult
-            try {
-                writeTempDebugLog(context, uri)
-                Toast.makeText(context, "Log exported", Toast.LENGTH_SHORT).show()
-            } catch (e: Throwable) {
-                Toast.makeText(context, "Export failed: ${e.message}", Toast.LENGTH_SHORT).show()
-            }
-        }
 
         Column(
             verticalArrangement = Arrangement.Top,
@@ -126,13 +113,6 @@ fun AboutScreen() {
                 icon = Icons.Rounded.Description,
                 title = stringRes(id = R.string.about__third_party_licenses__title),
                 onClick = { navController.navigate(Routes.Settings.ThirdPartyLicenses) },
-            )
-            // TEMP DEBUG (delete with the export-log commit).
-            SettingsDivider()
-            M3ClickablePreference(
-                icon = Icons.Rounded.BugReport,
-                title = "Export keystroke log (temp debug)",
-                onClick = { exportLog.launch("vikey-log.txt") },
             )
         }
     }
