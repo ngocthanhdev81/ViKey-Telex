@@ -107,10 +107,9 @@ abstract class AbstractEditorInstance(context: Context) {
         }
     private val expectedContentQueue = ExpectedContentQueue()
     /**
-     * Debug breadcrumbs for intermittent editor-state races (e.g. typed "và"
-     * rarely becoming "vvf"). Tiny ring buffer, always on: one short string
-     * per commit, negligible cost. Dump via [getCommitBreadcrumbs] when a
-     * corruption is reported (future: debug overlay).
+     * TEMP DEBUG (revert with the export-log commit): breadcrumbs for the
+     * Telex-death hunt. Ring buffer, always on: one short string per commit.
+     * Dump via [getCommitBreadcrumbs] / About → Export log.
      */
     private val commitBreadcrumbs = ArrayDeque<String>()
     @Volatile
@@ -120,7 +119,7 @@ abstract class AbstractEditorInstance(context: Context) {
         get() = runBlocking { expectedContentQueue.capEvictions }
 
     fun noteCommitBreadcrumb(msg: String) {
-        if (commitBreadcrumbs.size >= 50) commitBreadcrumbs.removeFirst()
+        if (commitBreadcrumbs.size >= 500) commitBreadcrumbs.removeFirst()
         commitBreadcrumbs.addLast("${SystemClock.uptimeMillis()}: $msg")
     }
 
@@ -425,12 +424,21 @@ abstract class AbstractEditorInstance(context: Context) {
             breakIterators.measureUChars(char, 1, subtypeManager.activeSubtype.primaryLocale)
         } == char.length
         if (!isSingleChar || selection.isNotValid || selection.isSelectionMode || activeInfo.isRawInputEditor) {
+            // TEMP DEBUG (revert with the export-log commit): which bypass fired.
+            noteCommitBreadcrumb(
+                "commitChar ch='$char' BYPASS single=$isSingleChar selValid=${selection.isNotValid.not()} " +
+                    "selMode=${selection.isSelectionMode} raw=${activeInfo.isRawInputEditor} sel=$selection"
+            )
             return commitTextInternal(char)
         }
         val ic = currentInputConnection() ?: return false
         val composer = determineComposer(subtypeManager.activeSubtype.composer)
         val previous = content.textBeforeSelection.takeLast(composer.toRead.coerceAtLeast(if (deletePreviousSpace) 1 else 0))
         val (tempRm, tempText) = composer.getActions(previous, char)
+        // TEMP DEBUG (revert with the export-log commit): composer decision per keystroke.
+        noteCommitBreadcrumb(
+            "commitChar ch='$char' composer=${composer.id} prevTail='${previous.takeLast(12)}' rm=$tempRm text='$tempText' sel=$selection"
+        )
         val rm = if (deletePreviousSpace && previous.isNotEmpty() && previous.last() == ' ') tempRm + 1 else tempRm
         val finalText = buildString(tempText.length + 2) {
             if (insertSpaceBeforeChar) append(' ')
