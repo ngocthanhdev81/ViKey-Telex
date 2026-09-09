@@ -26,7 +26,6 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
-import android.widget.Toolbar
 import androidx.activity.ComponentActivity
 import dev.ngocthanhgl.vikey.BuildConfig
 import dev.ngocthanhgl.vikey.R
@@ -68,10 +67,15 @@ class CrashDialogActivity : ComponentActivity() {
         val layout = layoutInflater.inflate(R.layout.crash_dialog, null)
         setContentView(layout)
 
-        val toolbar = layout.findViewById<Toolbar>(R.id.crash_dialog_toolbar)
-        setActionBar(toolbar)
-
-        stacktraces = CrashUtility.getUnhandledStacktraces(this)
+        // NOTE: no setActionBar() here on purpose. The layout uses a
+        // MaterialToolbar which is NOT an android.widget.Toolbar — casting it
+        // (as upstream code did) throws ClassCastException and the crash
+        // reporter itself crashes. The toolbar shows its title standalone.
+        try {
+            stacktraces = CrashUtility.getUnhandledStacktraces(this)
+        } catch (_: Throwable) {
+            stacktraces = listOf()
+        }
         val versionName = buildString {
             append("[")
             append(BuildConfig.VERSION_NAME)
@@ -90,14 +94,22 @@ class CrashDialogActivity : ComponentActivity() {
             appendLine("- Android: ${Devtools.getAndroidVersion()}")
             appendLine()
             appendLine("#### Attached logs and stacktrace files")
-            appendCollapsibleSection(
-                summary = "Detailed info (Debug log header)",
-                details = Devtools.generateDebugLog(this@CrashDialogActivity, prefs, includeLogcat = false),
-            )
+            try {
+                appendCollapsibleSection(
+                    summary = "Detailed info (Debug log header)",
+                    details = Devtools.generateDebugLog(this@CrashDialogActivity, prefs, includeLogcat = false),
+                )
+            } catch (e: Throwable) {
+                appendLine("(debug log unavailable: $e)")
+            }
             appendLine()
             if (stacktraces.isNotEmpty()) {
                 stacktraces.forEach {
-                    appendCollapsibleSection(it.name, it.details)
+                    try {
+                        appendCollapsibleSection(it.name, it.details)
+                    } catch (e: Throwable) {
+                        appendLine("(stacktrace '${it.name}' unreadable: $e)")
+                    }
                     appendLine()
                 }
             } else {
@@ -108,10 +120,15 @@ class CrashDialogActivity : ComponentActivity() {
         }
         stacktrace.text = errorReport
 
-        reportInstructions.text =
-            reportInstructions.text.toString().format(
-                resources.getString(R.string.crash_dialog__bug_report_template)
-            )
+        try {
+            reportInstructions.text =
+                reportInstructions.text.toString().format(
+                    resources.getString(R.string.crash_dialog__bug_report_template)
+                )
+        } catch (_: Throwable) {
+            // Keep the raw template text if formatting fails (e.g. a locale
+            // string without the %s placeholder).
+        }
 
         copyToClipboard.setOnClickListener {
             val clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE)
