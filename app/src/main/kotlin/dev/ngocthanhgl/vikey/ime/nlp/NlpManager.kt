@@ -123,24 +123,29 @@ class NlpManager(context: Context) {
     /**
      * Tracks the in-progress composition so that when a word boundary arrives
      * (whitespace via [clearCompositionState] or a punctuation keystroke) the just
-     * completed word can be learned into the personal dictionary and bigram model.
+     * completed word can be learned into the personal dictionary and N-gram model.
+     *
+     * [fullText] is the locally reconstructed window (history + in-progress word,
+     * up to composer.toRead chars, so it almost always contains spaces): only the
+     * LAST token is the live composition. A trailing non-letter (punctuation just
+     * typed) terminates the word — flush, don't pend.
      */
-    private fun noteCompositionProgress(prefix: String) {
-        val trimmed = prefix.trim()
-        if (trimmed.isEmpty()) {
+    private fun noteCompositionProgress(fullText: String) {
+        val trimmed = fullText.trim()
+        if (trimmed.isEmpty() || !trimmed.last().isLetter()) {
             flushPendingCompletion()
             return
         }
-        if (trimmed.length == 1 && !trimmed[0].isLetter()) {
-            // Punctuation terminates the word being typed.
+        // Last whitespace-chunk, edge punctuation stripped ("world." can't reach
+        // here — trailing non-letter flushed above). Interior apostrophes stay,
+        // so "don't" keeps the old behavior (flushed, not learned as a unit).
+        val core = trimmed.split(Regex("\\s+")).lastOrNull().orEmpty()
+            .trim { !it.isLetter() && it != '\'' }
+        if (core.isEmpty() || core.any { !it.isLetter() && it != '\'' }) {
             flushPendingCompletion()
             return
         }
-        if (trimmed.any { !it.isLetter() }) {
-            flushPendingCompletion()
-            return
-        }
-        pendingCompletion = trimmed.lowercase(Locale.ROOT)
+        pendingCompletion = core.lowercase(Locale.ROOT)
     }
 
     private fun flushPendingCompletion() {

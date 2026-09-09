@@ -515,13 +515,36 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
 
         if (pool.isEmpty()) return emptyList()
 
+        // Collapse folded-skeleton duplicates ("khong" 91 vs "không" 668048):
+        // keep the diacritic form so toneless corpus variants never surface
+        // next to (or above) the real word. Tie-break by pool frequency, so
+        // genuinely toneless words (loanwords) survive untouched.
+        val deduped = pool.keys
+            .groupBy { foldVietnamese(it) }
+            .map { (_, forms) ->
+                forms.minWithOrNull(
+                    compareBy<String> { form -> form.all { c -> c.code < 128 } }
+                        .thenByDescending { form -> pool[form] ?: 0 }
+                )!!
+            }
+
         // Rank by unified P(word | history): contextually natural continuations
         // float to the top instead of raw unigram frequency order.
-        val ranked = pool.keys
+        val ranked = deduped
             .map { lowerWord -> lowerWord to ngramProb(history, lowerWord) }
             .sortedByDescending { it.second }
 
-        return ranked.take(maxCandidateCount).mapIndexed { index, (lowerWord, prob) ->
+        // Reserve the last 2 slots for personal prefix-matches that didn't make
+        // the top ranks: a word the user bothered to teach the dictionary must
+        // actually show up, even with a low count.
+        val topCount = (maxCandidateCount - 2).coerceAtLeast(1)
+        val top = ranked.take(topCount)
+        val topWords = top.map { it.first }.toHashSet()
+        val personalExtra = ranked.drop(topCount)
+            .filter { (lowerWord, _) -> personalSnapshot[lowerWord] != null && lowerWord !in topWords }
+            .take(2)
+
+        return (top + personalExtra).take(maxCandidateCount).mapIndexed { index, (lowerWord, prob) ->
             buildCandidate(prefix, lowerWord, prob, index, maxCandidateCount)
         }
     }
@@ -606,15 +629,18 @@ class VietnameseLanguageProvider(context: Context) : SpellingProvider, Suggestio
     }
 
     /**
-     * Personal entries are stored lowercase; prefer the corpus's original casing when known.
-     * Folded skeletons (next-word keys like "khong") resolve through the folded
-     * index to the best original form ("không").
+     * Personal entries are stored lowercase; resolve through the folded index
+     * FIRST (bucket leader = highest corpus frequency, so "khong" restores to
+     * "không" 668048 instead of the toneless corpus variant "khong" 91), then
+     * fall back to the exact lowercase form (personal-only and ASCII words).
      */
     private fun restoreDictionaryCasing(lowerWord: String): String {
+        val folded = synchronized(dictLock) {
+            foldedIndex[foldVietnamese(lowerWord)]?.firstOrNull()
+        }
+        if (folded != null) return folded
         val original = synchronized(dictLock) { lowerToOriginal[lowerWord] }
-        if (original != null) return original
-        val folded = synchronized(dictLock) { foldedIndex[lowerWord]?.firstOrNull() }
-        return folded ?: lowerWord
+        return original ?: lowerWord
     }
 
     override suspend fun rerankGlideSuggestions(
